@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Shard Balances
 // @namespace    trading-ui-scripts
-// @version      2.1
-// @description  Hover panel showing cash on each exchange shard for every subaccount.
+// @version      3.0
+// @description  Hover panel showing, for the active subaccount, cash and estimated position value on each exchange shard.
 // @match        https://kalshi.com/*
 // @run-at       document-start
 // @grant        none
@@ -22,17 +22,17 @@
     { i: 2, name: 'Crypto/Cmdty' },
     { i: 3, name: 'Sports' },
   ];
-  const REFRESH_MS = 60000;           // one request per minute while the tab is visible
+  const REFRESH_MS = 60000;           // background refresh while the tab is visible
   const LS_SUB = 'kalshi-subaccount'; // the site's active-subaccount setting
   const NAMES_KEY = 'ksw-names';      // names learned by the Subaccount Switcher script
   // ──────────────────────────────────────────────────────────
 
   // Reuse the page's own API headers (in memory only), same as the switcher script.
+  // Only XHR is hooked (that's what Kalshi's app uses), and only headers on requests
+  // going to Kalshi's own API are remembered. Nothing is stored or sent anywhere else.
   const REPLAY = /^(x-csrf-token|x-aws-waf-token)$/i;
   const API_ORIGIN = 'https://api.elections.kalshi.com/';
   const siteHeaders = {};
-  // Only XHR is hooked (that's what Kalshi's app uses), and only headers on requests
-  // going to Kalshi's own API are remembered. Nothing is stored or sent anywhere else.
   const origOpen = XMLHttpRequest.prototype.open;
   XMLHttpRequest.prototype.open = function (m, url) {
     try { this.__tusKalshi = String(url || '').startsWith(API_ORIGIN); } catch (_) { this.__tusKalshi = false; }
@@ -50,9 +50,10 @@
     while (!siteHeaders['x-csrf-token'] && Date.now() - t0 < ms) await sleep(200);
     return !!siteHeaders['x-csrf-token'];
   }
-  // Read-only GETs to Kalshi's API only. On HTTP 429, refreshing pauses for 2 minutes.
+  // Read-only GETs to Kalshi's API only, one at a time. On HTTP 429, refreshing pauses for 2 minutes.
   let pausedUntil = 0;
   async function api(path) {
+    if (Date.now() < pausedUntil) throw new Error('paused (rate limited)');
     const r = await origFetch(API + path, { method: 'GET', credentials: 'include', headers: { Accept: 'application/json', ...siteHeaders } });
     if (r.status === 429) { pausedUntil = Date.now() + 120000; throw new Error('Rate limited — pausing refresh for 2 min'); }
     if (!r.ok) {
@@ -63,145 +64,182 @@
     return r.json();
   }
 
+  // ---------- Helpers ----------
+  const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+  const numOr = (v, d = null) => { const n = Number(v); return v === null || v === undefined || v === '' || !Number.isFinite(n) ? d : n; };
+  const money = (v) => {
+    if (!v) return '$0';
+    const a = Math.abs(v);
+    const s = a >= 100000 ? '$' + Math.round(a / 1000) + 'k' : '$' + a.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+    return v < 0 ? '−' + s : s;
+  };
   function names() {
     try {
       const s = JSON.parse(localStorage.getItem(NAMES_KEY));
       if (Array.isArray(s) && s.length) {
-        const clean = s.map((x) => ({ n: Math.trunc(Number(x && x.n)), name: String((x && x.name) || '').slice(0, 60) }))
+        return s.map((x) => ({ n: Math.trunc(Number(x && x.n)), name: String((x && x.name) || '').slice(0, 60) }))
           .filter((x) => Number.isFinite(x.n) && x.n >= 0 && x.n <= 63);
-        if (clean.length) return clean;
       }
     } catch (_) {}
-    return null;
+    return [];
   }
-  const subName = (n) => { const s = (names() || []).find((x) => x.n === n); return s ? s.name : (n === 0 ? 'Default' : 'Sub ' + n); };
+  const subName = (n) => { const s = names().find((x) => x.n === n); return s ? s.name : (n === 0 ? 'Default' : 'Sub ' + n); };
   function currentSub() {
     try { const n = Math.trunc(Number(JSON.parse(localStorage.getItem(LS_SUB)).state.subaccountNumber)); return Number.isFinite(n) && n >= 0 ? n : 0; } catch (_) { return 0; }
   }
-  function switchTo(n) {
-    if (n === currentSub()) return;
-    let obj; try { obj = JSON.parse(localStorage.getItem(LS_SUB)) || {}; } catch (_) { obj = {}; }
-    obj.state = { ...(obj.state || {}), subaccountNumber: n };   // change only this field
-    localStorage.setItem(LS_SUB, JSON.stringify(obj));
-    location.reload();
+
+  // ---------- Data (active subaccount only) ----------
+  // cash[shard] = available cash; pos[shard] = { value, cost, count, priced }
+  let data = null, err = null, loading = false, lastAt = 0, dataSub = null;
+
+  async function loadCash(sub) {
+    const cash = {};
+    try {
+      const j = await api(`/portfolio/balance?subaccount=${sub}`);
+      if (Array.isArray(j.balance_breakdown) && j.balance_breakdown.length) {
+        for (const b of j.balance_breakdown) {
+          const i = Math.trunc(Number(b.exchange_index)), v = numOr(b.balance);
+          if (Number.isFinite(i) && v !== null) cash[i] = (cash[i] || 0) + v;
+        }
+        return cash;
+      }
+    } catch (e) { if (/rate limited|paused/i.test(e.message)) throw e; }
+    // Fallback: the all-subaccounts endpoint, filtered to this one.
+    const j = await api('/portfolio/subaccounts/balances');
+    for (const b of j.subaccount_balances || []) {
+      if (Math.trunc(Number(b.subaccount_number)) !== sub) continue;
+      const i = Math.trunc(Number(b.exchange_index)), v = numOr(b.balance);
+      if (Number.isFinite(i) && v !== null) cash[i] = (cash[i] || 0) + v;
+    }
+    return cash;
   }
 
-  // ---------- Data ----------
-  // rows: Map<subaccount, { [shard]: dollars }>
-  let data = null, err = null, loading = false, lastAt = 0;
+  async function loadPositions(sub) {
+    const out = []; let cursor = '';
+    for (let page = 0; page < 5; page++) {
+      const j = await api(`/portfolio/positions?limit=1000&count_filter=position&subaccount=${sub}` + (cursor ? '&cursor=' + encodeURIComponent(cursor) : ''));
+      out.push(...(j.market_positions || []));
+      cursor = j.cursor || '';
+      if (!cursor) break;
+    }
+    return out.filter((p) => numOr(p.position_fp, numOr(p.position, 0)) !== 0);
+  }
+
+  async function loadPrices(tickers) {
+    const prices = {};
+    for (let k = 0; k < tickers.length; k += 100) {
+      const chunk = tickers.slice(k, k + 100);
+      const j = await api(`/markets?limit=1000&tickers=${encodeURIComponent(chunk.join(','))}`);
+      for (const m of j.markets || []) prices[m.ticker] = m;
+    }
+    return prices;
+  }
+
+  // Estimated value of one position: contracts × mid price of the side held.
+  // Falls back to last traded price, then to cost basis if the market has no prices.
+  function valuePosition(p, m) {
+    const count = numOr(p.position_fp, numOr(p.position, 0));
+    const qty = Math.abs(count), yes = count > 0;
+    const cost = numOr(p.market_exposure_dollars, numOr(p.market_exposure, 0) / 100) || 0;
+    if (m) {
+      const bid = numOr(yes ? m.yes_bid_dollars : m.no_bid_dollars);
+      const ask = numOr(yes ? m.yes_ask_dollars : m.no_ask_dollars);
+      if (bid !== null && ask !== null && ask > 0 && ask >= bid) return { value: qty * (bid + ask) / 2, cost, priced: true };
+      const last = numOr(m.last_price_dollars);
+      if (last !== null && last > 0) return { value: qty * (yes ? last : 1 - last), cost, priced: true };
+    }
+    return { value: cost, cost, priced: false };
+  }
 
   async function load() {
     if (loading || Date.now() < pausedUntil) return;
     loading = true; render();
+    const sub = currentSub();
     try {
       if (!(await waitForHeaders())) throw new Error('waiting for Kalshi to load');
-      const rows = new Map();
-      try {
-        // One call for every (subaccount, shard) pair.
-        const j = await api('/portfolio/subaccounts/balances');
-        for (const b of j.subaccount_balances || []) {
-          const n = Math.trunc(Number(b.subaccount_number)), i = Math.trunc(Number(b.exchange_index)), v = Number(b.balance);
-          if (!Number.isFinite(n) || !Number.isFinite(i) || !Number.isFinite(v)) continue;
-          if (!rows.has(n)) rows.set(n, {});
-          rows.get(n)[i] = (rows.get(n)[i] || 0) + v;
-        }
-      } catch (e) {
-        // Only fall back if the bulk endpoint isn't available to this session (404).
-        if (!/^(404|not_found)/i.test(String(e.message))) throw e;
-        // Fallback: per-subaccount balance with its per-shard breakdown. That endpoint is
-        // limited to ~1 request/second, so go one at a time.
-        if (Date.now() < pausedUntil) throw e;
-        const subs = (names() || Array.from({ length: 11 }, (_, n) => ({ n }))).map((s) => s.n);
-        for (const n of subs) {
-          if (Date.now() < pausedUntil) break;
-          try {
-            const j = await api(`/portfolio/balance?subaccount=${n}`);
-            const row = {};
-            if (Array.isArray(j.balance_breakdown) && j.balance_breakdown.length) {
-              for (const b of j.balance_breakdown) row[Number(b.exchange_index)] = Number(b.balance);
-            } else {
-              row[0] = j.balance_dollars != null ? Number(j.balance_dollars) : Number(j.balance) / 100;
-            }
-            rows.set(n, row);
-          } catch (_) {}
-          await sleep(1100);
-        }
-        if (!rows.size) throw e;
+      const cash = await loadCash(sub);
+      const positions = await loadPositions(sub);
+      let prices = {};
+      try { prices = await loadPrices([...new Set(positions.map((p) => p.ticker).filter(Boolean))]); } catch (_) {}
+      const pos = {};
+      for (const p of positions) {
+        const m = prices[p.ticker];
+        const i = Math.trunc(numOr(p.exchange_index, numOr(m && m.exchange_index, 0)));
+        const v = valuePosition(p, m);
+        const s = pos[i] || (pos[i] = { value: 0, cost: 0, count: 0, unpriced: 0 });
+        s.value += v.value; s.cost += v.cost; s.count++;
+        if (!v.priced) s.unpriced++;
       }
-      // Make sure every known subaccount shows, even at $0.
-      for (const s of names() || []) if (!rows.has(s.n)) rows.set(s.n, {});
-      data = rows; err = null; lastAt = Date.now();
+      data = { cash, pos }; dataSub = sub; err = null;
     } catch (e) {
       err = e.message || String(e);
-      lastAt = Date.now();                    // back off after errors too
     }
+    lastAt = Date.now();                       // back off after errors too
     loading = false; render();
   }
 
   // ---------- UI ----------
   const css = `
+  #tus-dock > #ksb{position:static}
   #ksb{order:1;font:12px/1.35 -apple-system,Segoe UI,Roboto,sans-serif;color:#e8ecef}
   #ksb .box{background:#14181d;border:1px solid #2b323a;border-radius:10px;box-shadow:0 8px 30px rgba(0,0,0,.45);overflow:hidden}
   #ksb .hdr{display:flex;align-items:center;gap:8px;padding:7px 10px;background:#1b2128;cursor:pointer;user-select:none;white-space:nowrap}
   #ksb .tot{background:#2a3340;color:#fff;border-radius:6px;padding:1px 7px;font-weight:600}
+  #ksb .who{color:#9aa6b2;font-size:11px;max-width:160px;overflow:hidden;text-overflow:ellipsis}
   #ksb .mini{display:flex;gap:6px;color:#9aa6b2;font-size:11px}
   #ksb .mini b{color:#cfd6dd;font-weight:600}
   #ksb .pin{color:#7d8995;font-size:11px}
   #ksb .body{padding:6px 8px 8px;max-height:40vh;overflow:auto}
   #ksb:not(.pinned):not(.open) .body{display:none}
   #ksb:not(.pinned):not(.open) .box{opacity:.85}
-  #ksb table{border-collapse:collapse;font-size:12px;font-variant-numeric:tabular-nums}
+  #ksb table{border-collapse:collapse;font-size:12px;font-variant-numeric:tabular-nums;width:100%}
   #ksb th{color:#9aa6b2;font-weight:600;font-size:11px;text-align:right;padding:3px 8px;border-bottom:1px solid #2b323a;white-space:nowrap}
   #ksb th:first-child{text-align:left}
   #ksb td{padding:3px 8px;text-align:right;border-bottom:1px solid #20262d;white-space:nowrap}
-  #ksb td:first-child{text-align:left;max-width:170px;overflow:hidden;text-overflow:ellipsis}
-  #ksb tr.sub{cursor:pointer}
-  #ksb tr.sub:hover td{background:#1c232b}
-  #ksb tr.active td{background:#123326}
-  #ksb tr.active td:first-child{box-shadow:inset 3px 0 0 #00a36c}
+  #ksb td:first-child{text-align:left}
   #ksb td.z{color:#4c5661}
   #ksb td.rowtot{font-weight:700;color:#fff}
+  #ksb td small{color:#7d8995;font-weight:400}
+  #ksb .up{color:#2fd27f}#ksb .dn{color:#ff6b6b}
   #ksb tfoot td{font-weight:700;border-top:1px solid #2b323a;border-bottom:0;color:#fff}
-  #ksb .foot{display:flex;justify-content:space-between;color:#7d8995;font-size:11px;margin-top:6px}
+  #ksb .foot{display:flex;justify-content:space-between;gap:10px;color:#7d8995;font-size:11px;margin-top:6px}
   #ksb .foot a{color:#7cc4ff;cursor:pointer}
   #ksb .err{color:#ff8a8a;padding:4px 2px}
   #ksb .muted{color:#7d8995}
   `;
 
   let root;
-  const money = (v) => {
-    if (!v) return '$0';
-    const a = Math.abs(v);
-    const s = a >= 100000 ? '$' + Math.round(a / 1000) + 'k' : '$' + a.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
-    return v < 0 ? '-' + s : s;
-  };
-  const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
-
   function render() {
     if (!root) return;
     const cur = currentSub();
-    const shardTot = {}; let grand = 0;
-    const rows = data ? [...data.entries()].sort((a, b) => a[0] - b[0]) : [];
-    for (const [, r] of rows) for (const s of SHARDS) { const v = r[s.i] || 0; shardTot[s.i] = (shardTot[s.i] || 0) + v; grand += v; }
+    const fresh = data && dataSub === cur;
+    const cash = fresh ? data.cash : {}, pos = fresh ? data.pos : {};
+    let tCash = 0, tVal = 0, tCost = 0, tUnpriced = 0;
+    const rows = SHARDS.map((s) => {
+      const c = cash[s.i] || 0, p = pos[s.i] || { value: 0, cost: 0, count: 0, unpriced: 0 };
+      tCash += c; tVal += p.value; tCost += p.cost; tUnpriced += p.unpriced;
+      const pnl = p.value - p.cost;
+      return `<tr><td>${esc(s.name)}</td>
+        <td class="${c ? '' : 'z'}">${money(c)}</td>
+        <td class="${p.count ? '' : 'z'}" title="${p.count ? `${p.count} position${p.count === 1 ? '' : 's'} · cost ${money(p.cost)} · ${pnl >= 0 ? '+' : '−'}${money(Math.abs(pnl))} unrealized` : ''}">${money(p.value)}${p.count ? ` <small>(${p.count})</small>` : ''}</td>
+        <td class="rowtot">${money(c + p.value)}</td></tr>`;
+    }).join('');
+    const tPnl = tVal - tCost;
+    const grand = tCash + tVal;
+    const mini = fresh ? SHARDS.map((s) => `<span title="${esc(s.name)}: cash + est. positions">${esc(s.name.split('/')[0])} <b>${money((cash[s.i] || 0) + ((pos[s.i] || {}).value || 0))}</b></span>`).join('') : '';
 
-    const mini = data ? SHARDS.map((s) => `<span title="${esc(s.name)}">${esc(s.name.split('/')[0])} <b>${money(shardTot[s.i] || 0)}</b></span>`).join('') : '';
-    const body = !data
+    const body = !fresh
       ? (err ? `<div class="err">${esc(err)}</div>` : '<div class="muted">Loading…</div>')
-      : `<table><thead><tr><th>Subaccount</th>${SHARDS.map((s) => `<th>${esc(s.name)}</th>`).join('')}<th>Total</th></tr></thead><tbody>` +
-        rows.map(([n, r]) => {
-          const t = SHARDS.reduce((a, s) => a + (r[s.i] || 0), 0);
-          return `<tr class="sub ${n === cur ? 'active' : ''}" data-n="${n}" title="Click to switch to this subaccount"><td>${n} · ${esc(subName(n))}</td>` +
-            SHARDS.map((s) => `<td class="${r[s.i] ? '' : 'z'}">${money(r[s.i] || 0)}</td>`).join('') + `<td class="rowtot">${money(t)}</td></tr>`;
-        }).join('') +
-        `</tbody><tfoot><tr><td>All</td>${SHARDS.map((s) => `<td>${money(shardTot[s.i] || 0)}</td>`).join('')}<td>${money(grand)}</td></tr></tfoot></table>` +
+      : `<table><thead><tr><th>Shard</th><th>Cash</th><th>Positions (est.)</th><th>Total</th></tr></thead><tbody>${rows}</tbody>
+          <tfoot><tr><td>All shards</td><td>${money(tCash)}</td><td>${money(tVal)}</td><td>${money(grand)}</td></tr></tfoot></table>` +
         (err ? `<div class="err">${esc(err)}</div>` : '') +
-        `<div class="foot"><span>${lastAt ? 'Updated ' + new Date(lastAt).toLocaleTimeString() : ''}</span><a data-act="refresh">${loading ? 'loading…' : 'refresh'}</a></div>`;
+        `<div class="foot"><span>Positions at mid price${tVal || tCost ? ` · <span class="${tPnl >= 0 ? 'up' : 'dn'}">${tPnl >= 0 ? '+' : '−'}${money(Math.abs(tPnl))}</span> vs cost` : ''}${tUnpriced ? ` · ${tUnpriced} at cost (no price)` : ''}${lastAt ? ' · ' + new Date(lastAt).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' }) : ''}</span><a data-act="refresh">${loading ? 'loading…' : 'refresh'}</a></div>`;
 
     const isOpen = root.classList.contains('open') || root.classList.contains('pinned');
     const prevBox = root.firstElementChild;
     if (isOpen && prevBox) root._minH = Math.max(root._minH || 0, prevBox.offsetHeight);
     root.innerHTML = `<div class="box"><div class="hdr" data-act="pin" title="Hover to open · click to pin open">
-      <span class="tot">Cash ${data ? money(grand) : '…'}</span><span class="mini">${mini}</span>
+      <span class="tot">${fresh ? money(grand) : '…'}</span><span class="who">${esc(subName(cur))}</span><span class="mini">${mini}</span>
       <span class="pin">${root.classList.contains('pinned') ? '📌' : '▴'}</span></div><div class="body">${body}</div></div>`;
     if (isOpen && root._minH) root.firstElementChild.style.minHeight = root._minH + 'px';
   }
@@ -218,9 +256,7 @@
     window.addEventListener('keydown', (e) => { if (e.key === 'Escape') close(); }, true);
   }
 
-
-  // Shared bottom-right stack used by all trading-ui-scripts panels, so they never overlap:
-  // each panel grows upward and pushes the ones above it out of the way.
+  // Shared bottom-right stack used by all trading-ui-scripts panels, so they never overlap.
   function getDock() {
     let d = document.getElementById('tus-dock');
     if (!d) {
@@ -248,8 +284,6 @@
 
   document.addEventListener('click', (e) => {
     if (!root || !root.contains(e.target)) return;
-    const row = e.target.closest('tr.sub');
-    if (row) { switchTo(Number(row.dataset.n)); return; }
     const a = e.target.closest('[data-act]');
     if (!a) return;
     if (a.dataset.act === 'refresh') load();
@@ -260,6 +294,8 @@
       render();
     }
   }, true);
+  // Subaccount switched in another tab → reload numbers for the new one.
+  window.addEventListener('storage', (e) => { if (e.key === LS_SUB) { render(); load(); } });
 
   function start() {
     build();
