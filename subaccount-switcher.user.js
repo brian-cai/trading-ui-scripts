@@ -1,11 +1,12 @@
 // ==UserScript==
 // @name         Subaccount Switcher
 // @namespace    trading-ui-scripts
-// @version      1.6
+// @version      2.1
 // @description  Fast subaccount switching, resting orders / positions on the current market across all subaccounts, and per-subaccount fill history.
 // @match        https://kalshi.com/*
 // @run-at       document-start
 // @grant        none
+// @noframes
 // @updateURL    https://raw.githubusercontent.com/brian-cai/trading-ui-scripts/main/subaccount-switcher.user.js
 // @downloadURL  https://raw.githubusercontent.com/brian-cai/trading-ui-scripts/main/subaccount-switcher.user.js
 // ==/UserScript==
@@ -21,14 +22,19 @@
   const NAMES_KEY = 'ksw-names';
   const API = 'https://api.elections.kalshi.com/trade-api/v2';
   const LS_KEY = 'kalshi-subaccount';     // where Kalshi's web app stores the active subaccount
-  const HOTKEYS = true;                    // Alt+0..9 switches to subaccount 0..9; Alt+` pins/unpins panel
+  const HOTKEYS = true;                    // Alt+Shift+0..9 switches to subaccount 0..9; Alt+Shift+` pins/unpins
   const HISTORY_LIMIT = 50;                // fills fetched per subaccount
   // ──────────────────────────────────────────────────────────
 
   function loadSubaccounts() {
     try {
       const saved = JSON.parse(localStorage.getItem(NAMES_KEY));
-      if (Array.isArray(saved) && saved.length) return saved;
+      if (Array.isArray(saved) && saved.length) {
+        const clean = saved
+          .map((x) => ({ n: Math.trunc(Number(x && x.n)), name: String((x && x.name) || '').slice(0, 60) }))
+          .filter((x) => Number.isFinite(x.n) && x.n >= 0 && x.n <= 63);
+        if (clean.length) return clean;
+      }
     } catch (_) {}
     return Array.from({ length: FALLBACK_COUNT }, (_, n) => ({ n, name: n === 0 ? 'Default' : 'Sub ' + n }));
   }
@@ -39,23 +45,21 @@
   // headers (CSRF / WAF). We remember the ones the page itself sets so our read-only
   // GETs look identical. Nothing is stored or sent anywhere except Kalshi's API.
   const REPLAY = /^(x-csrf-token|x-aws-waf-token)$/i;
+  const API_ORIGIN = 'https://api.elections.kalshi.com/';
   const siteHeaders = {};
+  // Only XHR is hooked (that's what Kalshi's app uses), and only headers on requests
+  // going to Kalshi's own API are remembered. Nothing is stored or sent anywhere else.
+  const origOpen = XMLHttpRequest.prototype.open;
+  XMLHttpRequest.prototype.open = function (m, url) {
+    try { this.__tusKalshi = String(url || '').startsWith(API_ORIGIN); } catch (_) { this.__tusKalshi = false; }
+    return origOpen.apply(this, arguments);
+  };
   const origSet = XMLHttpRequest.prototype.setRequestHeader;
   XMLHttpRequest.prototype.setRequestHeader = function (k, v) {
-    if (REPLAY.test(k)) siteHeaders[k.toLowerCase()] = v;
+    if (this.__tusKalshi && REPLAY.test(k)) siteHeaders[k.toLowerCase()] = v;
     return origSet.apply(this, arguments);
   };
-  const origFetch = window.fetch;
-  window.fetch = function (input, init) {
-    try {
-      const h = init && init.headers;
-      if (h) {
-        const entries = h instanceof Headers ? [...h.entries()] : Object.entries(h);
-        for (const [k, v] of entries) if (REPLAY.test(k)) siteHeaders[k.toLowerCase()] = v;
-      }
-    } catch (_) {}
-    return origFetch.apply(this, arguments);
-  };
+  const origFetch = window.fetch.bind(window);
 
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
   async function waitForHeaders(ms = 10000) {
@@ -63,11 +67,27 @@
     while (!siteHeaders['x-csrf-token'] && Date.now() - t0 < ms) await sleep(200);
     return !!siteHeaders['x-csrf-token'];
   }
+  // Read-only GETs to Kalshi's API only. At most MAX_CONCURRENT in flight so we never
+  // burst your account's rate limit (which your other tools/bots may share); on HTTP 429
+  // all background refreshing pauses for a couple of minutes.
+  const MAX_CONCURRENT = 3;
+  let inFlight = 0; const waiters = [];
+  let pausedUntil = 0;
+  const isPaused = () => Date.now() < pausedUntil;
   async function api(path) {
+    while (inFlight >= MAX_CONCURRENT) await new Promise((r) => waiters.push(r));
+    if (isPaused()) { const w = waiters.shift(); if (w) w(); throw new Error('paused (rate limited)'); }
+    inFlight++;
+    try { return await apiNow(path); }
+    finally { inFlight--; const w = waiters.shift(); if (w) w(); }
+  }
+  async function apiNow(path) {
     const r = await origFetch(API + path, {
+      method: 'GET',
       credentials: 'include',
       headers: { Accept: 'application/json', ...siteHeaders },
     });
+    if (r.status === 429) { pausedUntil = Date.now() + 120000; throw new Error('Rate limited — pausing auto-refresh for 2 min'); }
     if (!r.ok) {
       let code = r.status;
       try { const j = await r.json(); code = (j.error && (j.error.code || j.error.message)) || code; } catch (_) {}
@@ -78,15 +98,14 @@
 
   // ---------- Subaccount get/set ----------
   function currentSub() {
-    try { return JSON.parse(localStorage.getItem(LS_KEY)).state.subaccountNumber ?? 0; }
+    try { const n = Math.trunc(Number(JSON.parse(localStorage.getItem(LS_KEY)).state.subaccountNumber)); return Number.isFinite(n) && n >= 0 ? n : 0; }
     catch (_) { return 0; }
   }
   function switchTo(n) {
     if (n === currentSub()) return;
     let obj;
     try { obj = JSON.parse(localStorage.getItem(LS_KEY)) || {}; } catch (_) { obj = {}; }
-    obj.state = { ...(obj.state || {}), subaccountNumber: n };
-    if (obj.version === undefined) obj.version = 0;
+    obj.state = { ...(obj.state || {}), subaccountNumber: n };   // change only this field
     localStorage.setItem(LS_KEY, JSON.stringify(obj));
     location.reload();
   }
@@ -105,13 +124,17 @@
 
   // ---------- Helpers ----------
   const num = (...vals) => { for (const v of vals) if (v !== undefined && v !== null && v !== '') return Number(v); return 0; };
-  const esc = (s) => String(s ?? '').replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+  const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
   const fmtN = (n) => (n >= 10000 ? Math.round(n / 1000) + 'k' : n >= 1000 ? (n / 1000).toFixed(1) + 'k' : String(Math.round(n * 100) / 100));
   function priceCents(o) {
     const side = (o.side || '').toLowerCase();
-    if (side === 'no') return o.no_price ?? (o.no_price_dollars != null ? Math.round(o.no_price_dollars * 100) : null);
-    return o.yes_price ?? (o.yes_price_dollars != null ? Math.round(o.yes_price_dollars * 100) : null);
+    const raw = side === 'no'
+      ? (o.no_price ?? (o.no_price_dollars != null ? o.no_price_dollars * 100 : null))
+      : (o.yes_price ?? (o.yes_price_dollars != null ? o.yes_price_dollars * 100 : null));
+    const v = Math.round(Number(raw));
+    return raw == null || !Number.isFinite(v) ? null : v;
   }
+  const sideCls = (v) => (String(v || '').toLowerCase() === 'no' ? 'no' : String(v || '').toLowerCase() === 'yes' ? 'yes' : '');
   function shortTicker(t, event) {
     if (event && t && t.startsWith(event + '-')) return t.slice(event.length + 1);
     return t;
@@ -122,11 +145,10 @@
   // ---------- Market data (orders + positions per subaccount) ----------
   async function loadSub(n, ctx) {
     const q = ctx.event ? 'event_ticker=' + encodeURIComponent(ctx.event) : 'ticker=' + encodeURIComponent(ctx.market);
-    const [o, p, st] = await Promise.allSettled([
+    const [o, p] = await Promise.allSettled([
       api(`/portfolio/orders?status=resting&limit=200&subaccount=${n}&${q}`),
       // settlement_status=all + total_traded: includes flat and settled markets, for P&L on closed markets
       api(`/portfolio/positions?limit=200&count_filter=total_traded&settlement_status=all&subaccount=${n}&${q}`),
-      api(`/portfolio/settlements?limit=200&subaccount=${n}&${q}`),
     ]);
     // If the API ignores the subaccount param and returns everything, filter by field when present.
     const keep = (x) => {
@@ -136,11 +158,31 @@
     const orders = o.status === 'fulfilled' ? (o.value.orders || []).filter(keep) : null;
     const traded = p.status === 'fulfilled' ? (p.value.market_positions || []).filter(keep) : null;
     const positions = traded && traded.filter((x) => num(x.position, x.position_fp) !== 0);
-    const settlements = st.status === 'fulfilled' ? (st.value.settlements || []).filter(keep) : [];
     return {
-      n, orders, positions, traded, settlements,
+      n, orders, positions, traded,
       error: o.status === 'rejected' ? o.reason.message : (p.status === 'rejected' ? p.reason.message : null),
     };
+  }
+
+  // Settlements are only needed for the P&L tab, so they're fetched on demand.
+  const settle = { key: null, bySub: {}, loading: false };
+  async function loadSettlements(force) {
+    const ctx = marketContext();
+    if (!ctx) return;
+    const key = state.ctxKey;
+    if (!force && settle.key === key) return;
+    settle.key = key; settle.bySub = {}; settle.loading = true; render();
+    if (!(await waitForHeaders())) { settle.loading = false; render(); return; }
+    const q = ctx.event ? 'event_ticker=' + encodeURIComponent(ctx.event) : 'ticker=' + encodeURIComponent(ctx.market);
+    // Only subaccounts that traded this event can have a settlement on it.
+    const subs = SUBACCOUNTS.filter((s) => { const r = state.results[s.n]; return !r || !r.traded || r.traded.length; }).map((s) => s.n);
+    await Promise.all(subs.map(async (n) => {
+      try {
+        const j = await api(`/portfolio/settlements?limit=200&subaccount=${n}&${q}`);
+        if (settle.key === key) settle.bySub[n] = (j.settlements || []).filter((x) => { const s = x.subaccount ?? x.subaccount_number; return s == null || Number(s) === n; });
+      } catch (_) {}
+    }));
+    if (settle.key === key) { settle.loading = false; render(); }
   }
 
   // Per-market P&L for one subaccount: realized trading P&L from positions, plus the
@@ -154,7 +196,7 @@
       out.realized += num(p.realized_pnl_dollars, p.realized_pnl != null ? p.realized_pnl / 100 : null);
       out.fees += num(p.fees_paid_dollars, p.fees_paid != null ? p.fees_paid / 100 : null);
     }
-    for (const s of r.settlements || []) {
+    for (const s of (settle.key === state.ctxKey && settle.bySub[r.n]) || []) {
       out.any = true; out.settled = true; out.result = s.market_result || out.result;
       const cost = num(s.yes_total_cost_dollars, s.yes_total_cost != null ? s.yes_total_cost / 100 : null)
                  + num(s.no_total_cost_dollars, s.no_total_cost != null ? s.no_total_cost / 100 : null);
@@ -234,7 +276,7 @@
 
   // ---------- UI ----------
   const css = `
-  #ksw{position:fixed;right:14px;bottom:14px;z-index:2147483647;font:12px/1.35 -apple-system,Segoe UI,Roboto,sans-serif;color:#e8ecef}
+  #ksw{order:2;font:12px/1.35 -apple-system,Segoe UI,Roboto,sans-serif;color:#e8ecef}
   #ksw .box{background:#14181d;border:1px solid #2b323a;border-radius:10px;box-shadow:0 8px 30px rgba(0,0,0,.45);overflow:hidden;max-width:440px}
   #ksw .hdr{display:flex;align-items:center;gap:8px;padding:7px 10px;background:#1b2128;cursor:pointer;user-select:none;white-space:nowrap}
   #ksw .cur{background:#00a36c;color:#fff;border-radius:6px;padding:1px 7px;font-weight:600;max-width:200px;overflow:hidden;text-overflow:ellipsis}
@@ -244,10 +286,14 @@
   #ksw .dot.o{background:#5aa9ff}#ksw .dot.p{background:#2fd27f}
   #ksw .pin{color:#7d8995;font-size:11px}
   #ksw.pinned .pin{color:#00a36c}
-  /* Collapsed by default: only the header pill shows. Hover to peek, click header to pin open. */
-  #ksw:not(.pinned):not(:hover) .body{display:none}
-  #ksw:not(.pinned):not(:hover) .box{opacity:.85}
-  #ksw:hover .box,#ksw.pinned .box{min-width:320px}
+  /* Collapsed by default. Hover opens it; clicking inside keeps it open until you click
+     elsewhere or press Esc; clicking the header pins it open across page loads. */
+  #ksw:not(.pinned):not(.open) .body{display:none}
+  #ksw:not(.pinned):not(.open) .box{opacity:.85}
+  #ksw.open .box,#ksw.pinned .box{min-width:320px}
+  #ksw .stale{background:#3d1717;color:#ffd0d0;padding:6px 10px;border-bottom:1px solid #6b2525}
+  #ksw .stale a{color:#fff;text-decoration:underline;cursor:pointer;font-weight:600}
+  #ksw .note{color:#f5a524;font-size:11px;padding:4px 10px 0}
   /* "Jump to" section at the top of the panel */
   #ksw .jump{padding:7px 10px;background:#2a2110;border-bottom:1px solid #4a3a14;color:#fbe7c0}
   #ksw .jump .lbl{margin-bottom:5px}
@@ -274,7 +320,7 @@
   #ksw .tabs a.on{color:#e8ecef;border-bottom-color:#00a36c}
   #ksw .tabs .sp{flex:1}
   #ksw .tabs .rf{color:#7cc4ff;font-weight:500}
-  #ksw .view{padding:6px 10px 8px;max-height:34vh;overflow:auto}
+  #ksw .view{padding:6px 10px 8px;max-height:30vh;overflow:auto}
   #ksw .opts{display:flex;gap:12px;color:#9aa6b2;margin-bottom:6px;flex-wrap:wrap}
   #ksw .opts label{display:flex;align-items:center;gap:4px;cursor:pointer;user-select:none}
   #ksw .opts input{margin:0;accent-color:#00a36c}
@@ -302,18 +348,38 @@
   let root, state = { ctxKey: null, results: {}, loading: false, err: null }, jumpDismissedFor = null;
   const view = () => lsGet('ksw-view', 'market');
 
+
+  // Shared bottom-right stack used by all trading-ui-scripts panels, so they never overlap:
+  // each panel grows upward and pushes the ones above it out of the way.
+  function getDock() {
+    let d = document.getElementById('tus-dock');
+    if (!d) {
+      d = document.createElement('div'); d.id = 'tus-dock';
+      const st = document.createElement('style'); st.id = 'tus-dock-css';
+      st.textContent = '#tus-dock{position:fixed;right:14px;bottom:14px;z-index:2147483647;display:flex;flex-direction:column;align-items:flex-end;gap:6px;pointer-events:none;max-height:calc(100vh - 28px);max-width:calc(100vw - 28px)}#tus-dock>*{pointer-events:auto;max-width:100%}';
+      document.head.appendChild(st);
+      document.body.appendChild(d);
+    }
+    return d;
+  }
+
   function build() {
     if (root) return;
     const st = document.createElement('style'); st.textContent = css; document.head.appendChild(st);
     root = document.createElement('div'); root.id = 'ksw';
     if (lsGet('ksw-pin', '0') === '1') root.classList.add('pinned');
-    document.body.appendChild(root);
+    getDock().appendChild(root);
+    makeOpenable(root, () => {
+      render();
+      if (root.classList.contains('open')) backgroundTick(true);
+    });
     render();
   }
 
   function togglePin() {
     root.classList.toggle('pinned');
     lsSet('ksw-pin', root.classList.contains('pinned') ? '1' : '0');
+    if (!root.classList.contains('pinned')) root._minH = 0;
     render();
   }
 
@@ -328,7 +394,7 @@
         const px = priceCents(o);
         const hl = ctx.market && o.ticker === ctx.market;
         rows.push(`<tr class="${hl ? 'hl' : ''}"><td class="s">${esc(s.name)}</td><td class="tk">${esc(shortTicker(o.ticker, ctx.event))}</td>
-          <td>${esc((o.action || 'buy').toUpperCase())} <span class="${side}">${esc(side.toUpperCase())}</span></td>
+          <td>${esc((o.action || 'buy').toUpperCase())} <span class="${sideCls(side)}">${esc(side.toUpperCase())}</span></td>
           <td>${num(o.remaining_count, o.remaining_count_fp)} @ ${px != null ? px + '¢' : '?'}</td></tr>`);
       }
       for (const p of r.positions || []) {
@@ -376,7 +442,7 @@
       const qty = num(f.count, f.count_fp);
       return `<tr><td class="t">${esc(fmtTime(f.created_time))}</td>${all ? `<td class="s">${esc(subName(f._n))}</td>` : ''}
         <td class="tk" title="${esc(f.ticker)}">${esc(ctx ? shortTicker(f.ticker, ctx.event) : f.ticker)}</td>
-        <td>${esc((f.action || '').toUpperCase())} <span class="${side}">${esc(side.toUpperCase())}</span></td>
+        <td>${esc((f.action || '').toUpperCase())} <span class="${sideCls(side)}">${esc(side.toUpperCase())}</span></td>
         <td>${qty} @ ${px != null ? px + '¢' : '?'}</td></tr>`;
     }).join('')}</table>`;
     return opts + (hist.err ? `<div class="err">${esc(hist.err)}</div>` : '') + body;
@@ -386,6 +452,8 @@
     if (!root) return;
     SUBACCOUNTS = loadSubaccounts();
     const cur = currentSub();
+    if (shownSub === null) shownSub = cur;
+    const stale = staleFrom !== null && cur !== staleFrom;
     const ctx = marketContext();
     const res = state.results;
 
@@ -424,31 +492,58 @@
     const v = view();
     const busy = v === 'history' ? hist.loading : state.loading;
 
+    const isOpen = root.classList.contains('open') || root.classList.contains('pinned');
+    const prevBox = root.firstElementChild;
+    if (isOpen && prevBox) root._minH = Math.max(root._minH || 0, prevBox.offsetHeight);
     root.innerHTML = `<div class="box">
       <div class="hdr" data-act="pin" title="Hover to open · click to pin open"><span class="cur">${cur} · ${esc(subName(cur))}</span>${alert}${dots}<span class="pin">${root.classList.contains('pinned') ? '📌' : '▴'}</span></div>
-      <div class="body">${jump}<div class="grid">${subBtns}</div>
+      ${stale ? `<div class="stale">Subaccount changed to <b>${esc(subName(cur))}</b> in another tab — this page may still be trading on <b>${esc(subName(staleFrom))}</b>. <a data-act="reload">Reload</a></div>` : ''}
+      <div class="body">${isPaused() ? '<div class="note">Kalshi rate-limited us — auto-refresh paused for a moment.</div>' : ''}${jump}<div class="grid">${subBtns}</div>
         <div class="tabs"><a data-view="market" class="${v === 'market' ? 'on' : ''}">This market</a><a data-view="pnl" class="${v === 'pnl' ? 'on' : ''}">P&amp;L</a><a data-view="history" class="${v === 'history' ? 'on' : ''}">History</a>
           <span class="sp"></span><a class="rf" data-act="refresh">${busy ? 'loading…' : 'refresh'}</a></div>
         <div class="view">${v === 'history' ? historyView(ctx) : v === 'pnl' ? pnlView(ctx) : marketView(ctx)}</div>
       </div></div>`;
+    // Never shrink under the cursor while open (that used to close the panel).
+    if (isOpen && root._minH) root.firstElementChild.style.minHeight = root._minH + 'px';
+  }
+
+  // Open/close controller shared by the panels.
+  function makeOpenable(el, onChange) {
+    let held = false, timer = null;
+    const open = () => { clearTimeout(timer); if (!el.classList.contains('open')) { el.classList.add('open'); onChange(); } };
+    const close = () => { clearTimeout(timer); held = false; if (el.classList.contains('open')) { el.classList.remove('open'); el._minH = 0; onChange(); } };
+    el.addEventListener('mouseenter', open);
+    el.addEventListener('mouseleave', () => { if (!held) { clearTimeout(timer); timer = setTimeout(close, 300); } });
+    el.addEventListener('pointerdown', () => { held = true; open(); }, true);
+    document.addEventListener('pointerdown', (e) => { if (!el.contains(e.target)) close(); }, true);
+    window.addEventListener('keydown', (e) => { if (e.key === 'Escape') close(); }, true);
+    return { close };
   }
 
   async function refresh(force) {
     const ctx = marketContext();
     const key = ctx ? (ctx.event || '') + '|' + (ctx.market || '') : null;
     if (!force && key === state.ctxKey) return;
-    state.ctxKey = key; state.results = {}; state.err = null;
+    if (state.loading && key === state.ctxKey) return;
+    const sameMarket = key === state.ctxKey;
+    state.ctxKey = key; state.err = null;
+    if (!sameMarket) { state.results = {}; jumpDismissedFor = null; }
     if (!ctx) { render(); return; }
     state.loading = true; render();
     if (!(await waitForHeaders())) {
       state.loading = false; state.err = 'Waiting for Kalshi to make its first API call — click refresh in a moment.'; render(); return;
     }
     const myKey = key;
+    const fresh = {};
     await Promise.all(SUBACCOUNTS.map(async (s) => {
-      try { const r = await loadSub(s.n, ctx); if (state.ctxKey === myKey) { state.results[s.n] = r; render(); } }
-      catch (e) { if (state.ctxKey === myKey) { state.results[s.n] = { n: s.n, orders: [], positions: [], error: e.message }; render(); } }
+      try { fresh[s.n] = await loadSub(s.n, ctx); }
+      catch (e) { fresh[s.n] = { n: s.n, orders: [], positions: [], error: e.message }; }
+      if (state.ctxKey === myKey && !sameMarket) { state.results[s.n] = fresh[s.n]; render(); }
     }));
-    if (state.ctxKey === myKey) { state.loading = false; render(); }
+    if (state.ctxKey === myKey) {
+      state.results = fresh; state.loading = false; render();
+      if (view() === 'pnl') loadSettlements(!sameMarket ? true : false);
+    }
   }
 
   // ---------- Wiring ----------
@@ -461,12 +556,21 @@
     const b = e.target.closest('button.sub');
     if (b) { switchTo(Number(b.dataset.n)); return; }
     const tab = e.target.closest('[data-view]');
-    if (tab) { lsSet('ksw-view', tab.dataset.view); if (tab.dataset.view === 'history') loadHistory(false); render(); return; }
+    if (tab) {
+      lsSet('ksw-view', tab.dataset.view);
+      if (tab.dataset.view === 'history') loadHistory(false);
+      if (tab.dataset.view === 'pnl') loadSettlements(false);
+      render(); return;
+    }
     const a = e.target.closest('[data-act]');
     if (!a) return;
     if (a.dataset.act === 'pin') togglePin();
+    if (a.dataset.act === 'reload') location.reload();
     if (a.dataset.act === 'dismiss') { jumpDismissedFor = state.ctxKey; render(); }
-    if (a.dataset.act === 'refresh') { if (view() === 'history') loadHistory(true); else refresh(true); }
+    if (a.dataset.act === 'refresh') {
+      if (view() === 'history') loadHistory(true);
+      else { refresh(true); if (view() === 'pnl') loadSettlements(true); }
+    }
   }, true);
   document.addEventListener('change', (e) => {
     if (!root || !root.contains(e.target)) return;
@@ -474,9 +578,18 @@
     if (opt) { lsSet(opt, e.target.checked ? '1' : '0'); loadHistory(true); }
   }, true);
 
+  // If another tab switches subaccount, this tab's trading UI may still be on the old one.
+  let staleFrom = null;
+  window.addEventListener('storage', (e) => {
+    if (e.key !== LS_KEY) return;
+    if (staleFrom === null) staleFrom = shownSub;
+    render();
+  });
+  let shownSub = null;
+
   if (HOTKEYS) {
     window.addEventListener('keydown', (e) => {
-      if (!e.altKey || e.ctrlKey || e.metaKey) return;
+      if (!e.altKey || !e.shiftKey || e.ctrlKey || e.metaKey) return;   // Alt+Shift only, to avoid accidental reloads
       const tag = (e.target && e.target.tagName) || '';
       if (/INPUT|TEXTAREA|SELECT/.test(tag) || (e.target && e.target.isContentEditable)) return;
       if (e.code === 'Backquote') { e.preventDefault(); togglePin(); return; }
@@ -502,24 +615,33 @@
     render();
   }
 
+  let lastTick = 0;
+  function backgroundTick(onOpen) {
+    if (document.hidden || isPaused()) return;
+    if (!root || !(root.classList.contains('open') || root.classList.contains('pinned'))) return;
+    if (onOpen && Date.now() - lastTick < 20000) return;   // just refreshed; don't refetch on every hover
+    lastTick = Date.now();
+    if (marketContext()) refresh(true);
+    if (view() === 'history') loadHistory(true);
+  }
+
   function start() {
     build();
-    refresh(true);
-    if (view() === 'history') loadHistory(true);
+    refresh(true);                          // one load per market so the ⚡ indicator is right
+    lastTick = Date.now();
     learnNames();
     setInterval(learnNames, 1500);
-    let last = location.href;               // Kalshi is a SPA — watch for in-app navigation
+    let last = location.href, navTimer = null;               // Kalshi is a SPA — watch for in-app navigation
     setInterval(() => {
       if (location.href !== last) {
-        last = location.href; refresh(false);
+        last = location.href;
+        clearTimeout(navTimer);
+        navTimer = setTimeout(() => refresh(false), 1200);   // wait until you settle on a market
         if (view() === 'history' && lsGet('ksw-hist-mkt', '0') === '1') loadHistory(false);
       }
     }, 400);
-    setInterval(() => {                     // light auto-refresh
-      if (document.hidden) return;
-      if (marketContext()) refresh(true);
-      if (view() === 'history') loadHistory(true);
-    }, 30000);
+    // Background refresh: only while the panel is open/pinned and the tab is visible.
+    setInterval(() => backgroundTick(false), 45000);
   }
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', start);
   else start();
