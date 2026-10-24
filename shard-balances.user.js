@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Shard Balances
 // @namespace    trading-ui-scripts
-// @version      3.0
+// @version      3.1
 // @description  Hover panel showing, for the active subaccount, cash and estimated position value on each exchange shard.
 // @match        https://kalshi.com/*
 // @run-at       document-start
@@ -182,13 +182,15 @@
   const css = `
   #tus-dock > #ksb{position:static}
   #ksb{order:1;font:12px/1.35 -apple-system,Segoe UI,Roboto,sans-serif;color:#e8ecef}
-  #ksb .box{background:#14181d;border:1px solid #2b323a;border-radius:10px;box-shadow:0 8px 30px rgba(0,0,0,.45);overflow:hidden}
+  /* Header sits at the bottom so it stays under your cursor while the panel opens upward. */
+  #ksb .box{display:flex;flex-direction:column-reverse;background:#14181d;border:1px solid #2b323a;border-radius:10px;box-shadow:0 8px 30px rgba(0,0,0,.45);overflow:hidden}
   #ksb .hdr{display:flex;align-items:center;gap:8px;padding:7px 10px;background:#1b2128;cursor:pointer;user-select:none;white-space:nowrap}
   #ksb .tot{background:#2a3340;color:#fff;border-radius:6px;padding:1px 7px;font-weight:600}
   #ksb .who{color:#9aa6b2;font-size:11px;max-width:160px;overflow:hidden;text-overflow:ellipsis}
   #ksb .mini{display:flex;gap:6px;color:#9aa6b2;font-size:11px}
   #ksb .mini b{color:#cfd6dd;font-weight:600}
-  #ksb .pin{color:#7d8995;font-size:11px}
+  #ksb .pin{color:#9aa6b2;font-size:14px;line-height:1;width:20px;height:18px;display:inline-flex;align-items:center;justify-content:center;border-radius:5px;margin-left:2px}
+  #ksb .pin:hover{background:#2b333d;color:#fff}
   #ksb .body{padding:6px 8px 8px;max-height:40vh;overflow:auto}
   #ksb:not(.pinned):not(.open) .body{display:none}
   #ksb:not(.pinned):not(.open) .box{opacity:.85}
@@ -238,20 +240,21 @@
     const isOpen = root.classList.contains('open') || root.classList.contains('pinned');
     const prevBox = root.firstElementChild;
     if (isOpen && prevBox) root._minH = Math.max(root._minH || 0, prevBox.offsetHeight);
-    root.innerHTML = `<div class="box"><div class="hdr" data-act="pin" title="Hover to open · click to pin open">
+    root.innerHTML = `<div class="box"><div class="hdr" data-act="pin" title="${root.classList.contains('pinned') ? 'Click to minimize' : 'Minimized — hover to peek, click to keep open'}">
       <span class="tot">${fresh ? money(grand) : '…'}</span><span class="who">${esc(subName(cur))}</span><span class="mini">${mini}</span>
-      <span class="pin">${root.classList.contains('pinned') ? '📌' : '▴'}</span></div><div class="body">${body}</div></div>`;
+      <span class="pin" title="${root.classList.contains('pinned') ? 'Minimize' : 'Keep open'}">${root.classList.contains('pinned') ? '–' : '+'}</span></div><div class="body">${body}</div></div>`;
     if (isOpen && root._minH) root.firstElementChild.style.minHeight = root._minH + 'px';
   }
 
   // Hover opens; clicking inside keeps it open until you click elsewhere or press Esc.
   function makeOpenable(el, onChange) {
     let held = false, timer = null;
-    const open = () => { clearTimeout(timer); if (!el.classList.contains('open')) { el.classList.add('open'); onChange(); } };
+    const open = () => { clearTimeout(timer); if (el._noPeek) return; if (!el.classList.contains('open')) { el.classList.add('open'); onChange(); } };
     const close = () => { clearTimeout(timer); held = false; if (el.classList.contains('open')) { el.classList.remove('open'); el._minH = 0; onChange(); } };
     el.addEventListener('mouseenter', open);
-    el.addEventListener('mouseleave', () => { if (!held) { clearTimeout(timer); timer = setTimeout(close, 300); } });
-    el.addEventListener('pointerdown', () => { held = true; open(); }, true);
+    el.addEventListener('mouseleave', () => { el._noPeek = false; if (!held) { clearTimeout(timer); timer = setTimeout(close, 300); } });
+    el.addEventListener('pointerdown', (e) => { if (e.target.closest && e.target.closest('[data-act="pin"]')) return; held = true; open(); }, true);
+    el._closeNow = close;
     document.addEventListener('pointerdown', (e) => { if (!el.contains(e.target)) close(); }, true);
     window.addEventListener('keydown', (e) => { if (e.key === 'Escape') close(); }, true);
   }
@@ -290,7 +293,7 @@
     if (a.dataset.act === 'pin') {
       root.classList.toggle('pinned');
       try { localStorage.setItem('ksb-pin', root.classList.contains('pinned') ? '1' : '0'); } catch (_) {}
-      if (!root.classList.contains('pinned')) root._minH = 0;
+      if (!root.classList.contains('pinned')) { root._minH = 0; root._noPeek = true; if (root._closeNow) root._closeNow(); }
       render();
     }
   }, true);

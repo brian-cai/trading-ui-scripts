@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Subaccount Switcher
 // @namespace    trading-ui-scripts
-// @version      2.6
+// @version      2.7
 // @description  Fast subaccount switching, resting orders / positions / P&L / canceled orders on the current market across all subaccounts, and per-subaccount fill history.
 // @match        https://kalshi.com/*
 // @run-at       document-start
@@ -492,15 +492,16 @@
   const css = `
   #tus-dock > #ksw{position:static}   /* in case an old copy's styles are still on the page */
   #ksw{order:2;font:12px/1.35 -apple-system,Segoe UI,Roboto,sans-serif;color:#e8ecef}
-  #ksw .box{background:#14181d;border:1px solid #2b323a;border-radius:10px;box-shadow:0 8px 30px rgba(0,0,0,.45);overflow:hidden;max-width:440px}
+  /* Header sits at the bottom so it stays under your cursor while the panel opens upward. */
+  #ksw .box{display:flex;flex-direction:column-reverse;background:#14181d;border:1px solid #2b323a;border-radius:10px;box-shadow:0 8px 30px rgba(0,0,0,.45);overflow:hidden;max-width:440px}
   #ksw .hdr{display:flex;align-items:center;gap:8px;padding:7px 10px;background:#1b2128;cursor:pointer;user-select:none;white-space:nowrap}
   #ksw .cur{background:#00a36c;color:#fff;border-radius:6px;padding:1px 7px;font-weight:600;max-width:200px;overflow:hidden;text-overflow:ellipsis}
   #ksw .alert{background:#f5a524;color:#111;border-radius:6px;padding:1px 6px;font-weight:700}
   #ksw .dots{display:flex;gap:3px;margin-left:auto}
   #ksw .dot{width:7px;height:7px;border-radius:50%}
   #ksw .dot.o{background:#5aa9ff}#ksw .dot.p{background:#2fd27f}
-  #ksw .pin{color:#7d8995;font-size:11px}
-  #ksw.pinned .pin{color:#00a36c}
+  #ksw .pin{color:#9aa6b2;font-size:14px;line-height:1;width:20px;height:18px;display:inline-flex;align-items:center;justify-content:center;border-radius:5px;margin-left:2px}
+  #ksw .pin:hover{background:#2b333d;color:#fff}
   /* Collapsed by default. Hover opens it; clicking inside keeps it open until you click
      elsewhere or press Esc; clicking the header pins it open across page loads. */
   #ksw:not(.pinned):not(.open) .body{display:none}
@@ -594,7 +595,7 @@
   function togglePin() {
     root.classList.toggle('pinned');
     lsSet('ksw-open', root.classList.contains('pinned') ? '1' : '0');
-    if (!root.classList.contains('pinned')) root._minH = 0;
+    if (!root.classList.contains('pinned')) { root._minH = 0; root._noPeek = true; if (root._closeNow) root._closeNow(); }
     render();
   }
 
@@ -757,7 +758,7 @@
     const prevBox = root.firstElementChild;
     if (isOpen && prevBox) root._minH = Math.max(root._minH || 0, prevBox.offsetHeight);
     root.innerHTML = `<div class="box">
-      <div class="hdr" data-act="pin" title="Hover to open · click to pin open"><span class="cur">${cur} · ${esc(subName(cur))}</span>${alert}${dots}<span class="pin">${root.classList.contains('pinned') ? '📌' : '▴'}</span></div>
+      <div class="hdr" data-act="pin" title="${root.classList.contains('pinned') ? 'Click to minimize' : 'Minimized — hover to peek, click to keep open'}"><span class="cur">${cur} · ${esc(subName(cur))}</span>${alert}${dots}<span class="pin" title="${root.classList.contains('pinned') ? 'Minimize' : 'Keep open'}">${root.classList.contains('pinned') ? '–' : '+'}</span></div>
       ${oldCopy ? `<div class="stale">An <b>old copy</b> of this script is still installed. Open the Tampermonkey Dashboard and delete <b>"Kalshi Quick Subaccount Switcher + Market Orders"</b> (or any other older Subaccount Switcher).</div>` : ''}
       ${stale ? `<div class="stale">Subaccount changed to <b>${esc(subName(cur))}</b> in another tab — this page may still be trading on <b>${esc(subName(staleFrom))}</b>. <a data-act="reload">Reload</a></div>` : ''}
       <div class="body">${isPaused() ? '<div class="note">Kalshi rate-limited us — auto-refresh paused for a moment.</div>' : ''}${jump}<div class="grid">${subBtns}</div>
@@ -772,11 +773,12 @@
   // Open/close controller shared by the panels.
   function makeOpenable(el, onChange) {
     let held = false, timer = null;
-    const open = () => { clearTimeout(timer); if (!el.classList.contains('open')) { el.classList.add('open'); onChange(); } };
+    const open = () => { clearTimeout(timer); if (el._noPeek) return; if (!el.classList.contains('open')) { el.classList.add('open'); onChange(); } };
     const close = () => { clearTimeout(timer); held = false; if (el.classList.contains('open')) { el.classList.remove('open'); el._minH = 0; onChange(); } };
     el.addEventListener('mouseenter', open);
-    el.addEventListener('mouseleave', () => { if (!held) { clearTimeout(timer); timer = setTimeout(close, 300); } });
-    el.addEventListener('pointerdown', () => { held = true; open(); }, true);
+    el.addEventListener('mouseleave', () => { el._noPeek = false; if (!held) { clearTimeout(timer); timer = setTimeout(close, 300); } });
+    el.addEventListener('pointerdown', (e) => { if (e.target.closest && e.target.closest('[data-act="pin"]')) return; held = true; open(); }, true);
+    el._closeNow = close;
     document.addEventListener('pointerdown', (e) => { if (!el.contains(e.target)) close(); }, true);
     window.addEventListener('keydown', (e) => { if (e.key === 'Escape') close(); }, true);
     return { close };
