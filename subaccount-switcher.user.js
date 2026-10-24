@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Subaccount Switcher
 // @namespace    trading-ui-scripts
-// @version      2.5
+// @version      2.6
 // @description  Fast subaccount switching, resting orders / positions / P&L / canceled orders on the current market across all subaccounts, and per-subaccount fill history.
 // @match        https://kalshi.com/*
 // @run-at       document-start
@@ -378,6 +378,116 @@
     if (canc.key === key) { canc.loading = false; render(); }
   }
 
+
+  // ---------- Overview (category / non-market pages) ----------
+  // Open positions and resting bids for every subaccount, so you can see which subaccount
+  // to switch to while browsing. On /category/... pages it's narrowed to that category:
+  // a position counts if its series is listed on the page, or its event's Kalshi category
+  // matches the page (event categories are looked up once and cached in your browser).
+  const ov = { at: 0, bySub: null, orders: null, loading: false, err: null };
+  const CAT_CACHE_KEY = 'ksw-evcat';
+  let catCache = (() => { try { const c = JSON.parse(localStorage.getItem(CAT_CACHE_KEY)); return c && typeof c === 'object' ? c : {}; } catch (_) { return {}; } })();
+  const saveCats = () => {
+    const keys = Object.keys(catCache);
+    if (keys.length > 3000) keys.slice(0, keys.length - 3000).forEach((k) => delete catCache[k]);
+    lsSet(CAT_CACHE_KEY, JSON.stringify(catCache));
+  };
+  const eventOf = (t) => { t = String(t || ''); const i = t.lastIndexOf('-'); return i > 0 ? t.slice(0, i) : t; };
+  function categoryContext() {
+    if (marketContext()) return null;
+    const m = /^\/category\/([^/?#]+)(?:\/([^/?#]+))?/.exec(location.pathname);
+    return m ? { slug: decodeURIComponent(m[1]).toLowerCase(), sub: m[2] ? decodeURIComponent(m[2]).toLowerCase() : null } : null;
+  }
+  // Series tickers of markets currently listed on the page (/markets/<series>/...).
+  function seriesOnPage() {
+    const set = new Set();
+    document.querySelectorAll('a[href^="/markets/"]').forEach((a) => {
+      const seg = (a.getAttribute('href') || '').split('/')[2];
+      if (seg && /^[a-z0-9]+$/i.test(seg)) set.add(seg.toUpperCase());
+    });
+    return set;
+  }
+  function catMatches(slug, category) {
+    const norm = (x) => String(x || '').toLowerCase().replace(/[^a-z]/g, '');
+    const c = norm(category); if (!c) return false;
+    return slug.split('-').map(norm).filter((t) => t.length >= 4).some((t) => c.includes(t.slice(0, 6)) || t.includes(c));
+  }
+  async function loadOverview(force) {
+    if (ov.loading || (!force && ov.bySub && Date.now() - ov.at < 60000)) return;
+    ov.loading = true; ov.err = null; render();
+    try {
+      if (!(await waitForHeaders())) throw new Error('Waiting for Kalshi to load — try refresh.');
+      // Resting orders: one call covers every subaccount.
+      const orders = [];
+      let cursor = '';
+      for (let i = 0; i < 3; i++) {
+        const j = await api('/portfolio/orders?status=resting&limit=1000' + (cursor ? '&cursor=' + encodeURIComponent(cursor) : ''));
+        orders.push(...(j.orders || [])); cursor = j.cursor || ''; if (!cursor) break;
+      }
+      const bySub = {};
+      for (const s of SUBACCOUNTS) bySub[s.n] = { positions: [], orders: [] };
+      for (const o of orders) {
+        const n = Math.trunc(Number(o.subaccount_number ?? o.subaccount ?? 0));
+        (bySub[n] || (bySub[n] = { positions: [], orders: [] })).orders.push(o);
+      }
+      // Open positions: one call per subaccount.
+      await Promise.all(SUBACCOUNTS.map(async (s) => {
+        try {
+          const j = await api(`/portfolio/positions?limit=1000&count_filter=position&subaccount=${s.n}`);
+          bySub[s.n].positions = (j.market_positions || []).filter((p) => num(p.position, p.position_fp) !== 0);
+        } catch (e) { bySub[s.n].error = e.message; }
+      }));
+      ov.bySub = bySub; ov.at = Date.now();
+      await loadCategories();
+    } catch (e) { ov.err = e.message; }
+    ov.loading = false; render();
+  }
+  // Look up Kalshi's category for events we hold/bid on (only on category pages; cached).
+  async function loadCategories() {
+    if (!categoryContext() || !ov.bySub) return;
+    const events = new Set();
+    for (const r of Object.values(ov.bySub)) for (const x of [...r.positions, ...r.orders]) events.add(eventOf(x.ticker));
+    const todo = [...events].filter((e) => e && !(e in catCache)).slice(0, 60);
+    for (const e of todo) {
+      try { const j = await api(`/events/${encodeURIComponent(e)}`); catCache[e] = String((j.event && j.event.category) || ''); }
+      catch (err) { if (/^404|not_found/i.test(err.message)) catCache[e] = ''; else break; }
+    }
+    if (todo.length) saveCats();
+  }
+  // Positions/orders per subaccount, narrowed to the current category page when asked.
+  function overviewResults() {
+    if (!ov.bySub) return {};
+    const cat = categoryContext();
+    const narrow = cat && lsGet('ksw-cat-only', '1') === '1';
+    const series = narrow ? seriesOnPage() : null;
+    const keep = (x) => {
+      if (!narrow) return true;
+      const t = String(x.ticker || '').toUpperCase();
+      for (const se of series) if (t.startsWith(se + '-')) return true;
+      return catMatches(cat.slug, catCache[eventOf(t)]);
+    };
+    const out = {};
+    for (const [n, r] of Object.entries(ov.bySub)) out[n] = { n: Number(n), positions: r.positions.filter(keep), orders: r.orders.filter(keep), error: r.error };
+    return out;
+  }
+  function overviewView(res) {
+    const cat = categoryContext(), cur = currentSub();
+    const narrow = cat && lsGet('ksw-cat-only', '1') === '1';
+    const label = cat ? (cat.sub ? `${cat.slug} › ${cat.sub}` : cat.slug) : '';
+    const opts = cat ? `<div class="opts"><label title="Only count markets in this category (listed on the page, or in Kalshi's category for the event)"><input type="checkbox" data-opt="ksw-cat-only" ${narrow ? 'checked' : ''}> This category only (${esc(label)})</label></div>` : '';
+    if (!ov.bySub) return opts + (ov.err ? `<div class="err">${esc(ov.err)}</div>` : '<div class="muted">Loading…</div>');
+    const rows = SUBACCOUNTS.map((s) => ({ s, ...summarize(res[s.n]), err: res[s.n] && res[s.n].error }))
+      .filter((x) => x.positions || x.orders || x.err)
+      .sort((a, b) => (b.positions + b.orders) - (a.positions + a.orders) || b.contracts - a.contracts);
+    const where = narrow ? 'in this category' : 'anywhere';
+    if (!rows.length) return opts + `<div class="muted">No open positions or resting bids ${where}.</div>`;
+    const tot = rows.reduce((a, x) => ({ p: a.p + x.positions, c: a.c + x.contracts, o: a.o + x.orders }), { p: 0, c: 0, o: 0 });
+    return opts + `<table class="pl"><thead><tr><th>Subaccount</th><th>Positions</th><th>Contracts</th><th>Bids</th></tr></thead><tbody>` +
+      rows.map((x) => `<tr class="go ${x.s.n === cur ? 'me' : ''}" data-n="${x.s.n}" title="Click to switch to ${esc(x.s.name)}${x.exposure != null ? ' · cost $' + fmtN(Math.round(x.exposure)) : ''}">
+        <td class="s">${esc(x.s.name)}</td><td>${x.positions || '<span class="muted">0</span>'}</td><td>${fmtN(x.contracts)}</td><td>${x.orders || '<span class="muted">0</span>'}</td></tr>`).join('') +
+      `</tbody><tfoot><tr><td>All</td><td>${tot.p}</td><td>${fmtN(tot.c)}</td><td>${tot.o}</td></tr></tfoot></table>`;
+  }
+
   // ---------- UI ----------
   const css = `
   #tus-dock > #ksw{position:static}   /* in case an old copy's styles are still on the page */
@@ -588,7 +698,7 @@
     if (shownSub === null) shownSub = cur;
     const stale = staleFrom !== null && cur !== staleFrom;
     const ctx = marketContext();
-    const res = state.results;
+    const res = ctx ? state.results : overviewResults();
 
     // Subaccount grid
     let nOrd = 0, nPos = 0;
@@ -596,11 +706,11 @@
       const x = summarize(res[s.n]);
       if (x.orders) nOrd++;
       if (x.contracts) nPos++;
-      const posTag = x.contracts ? `<span class="t-p">${esc(tagText({ ...x, orders: 0 })[0])}</span>` : '';
-      const ordTag = x.orders ? `<span class="t-o">${x.orders} ord</span>` : '';
+      const posTag = x.contracts ? `<span class="t-p">${ctx ? esc(tagText({ ...x, orders: 0 })[0]) : `${x.positions} pos · ${fmtN(x.contracts)}`}</span>` : '';
+      const ordTag = x.orders ? `<span class="t-o">${x.orders} ${ctx ? 'ord' : 'bid' + (x.orders === 1 ? '' : 's')}</span>` : '';
       const pl = pnlFor(res[s.n]);
       const plTag = !x.orders && !x.contracts && pl.any && Math.abs(pl.total) >= 0.005 ? `<span class="${pl.total >= 0 ? 't-up' : 't-dn'}">${pnlStr(pl.total)}</span>` : '';
-      const title = res[s.n] ? ` — ${x.orders} resting orders, ${fmtN(x.contracts)} contracts held on this event` : '';
+      const title = res[s.n] ? ` — ${x.orders} resting orders, ${fmtN(x.contracts)} contracts held ${ctx ? 'on this event' : categoryContext() && lsGet('ksw-cat-only', '1') === '1' ? 'in this category' : 'in total'}` : '';
       return `<button class="sub ${s.n === cur ? 'active' : ''} ${x.orders ? 'ord' : ''} ${x.contracts ? 'pos' : ''}" data-n="${s.n}" title="${s.n}: ${esc(s.name)}${title}">
         <span class="nm">${s.n <= 9 && HOTKEYS ? `<span class="muted">${s.n}</span> ` : ''}${esc(s.name)}</span><span class="tags">${posTag}${ordTag}${plTag}</span></button>`;
     }).join('');
@@ -621,9 +731,27 @@
       }
     }
 
+    if (!ctx && ov.bySub && jumpDismissedFor !== 'ov|' + location.pathname) {
+      const cat = categoryContext();
+      const narrow = cat && lsGet('ksw-cat-only', '1') === '1';
+      const mine = summarize(res[cur]);
+      const others = SUBACCOUNTS.filter((s) => s.n !== cur).map((s) => ({ s, ...summarize(res[s.n]) }))
+        .filter((x) => x.positions + x.orders > 0)
+        .sort((a, b) => (b.positions + b.orders) - (a.positions + a.orders) || b.contracts - a.contracts);
+      if (others.length && (narrow || mine.positions + mine.orders === 0)) {
+        const where = narrow ? ' in this category' : '';
+        alert = `<span class="alert" title="Subaccounts with open positions or bids${where}">⚡ ${others.length}</span>`;
+        const lbl = mine.positions + mine.orders === 0
+          ? `Nothing open${where} on <b>${esc(subName(cur))}</b> — switch to:`
+          : `<b>${esc(subName(cur))}</b>: ${mine.positions} pos, ${mine.orders} bids${where}. Also active:`;
+        jump = `<div class="jump"><div class="lbl">${lbl} <a data-act="dismiss" class="muted" style="float:right;cursor:pointer" title="Hide on this page">✕</a></div>
+          <div class="btns">${others.map((x) => `<button data-jump="${x.s.n}">${esc(x.s.name)} <small>${[x.positions ? `${x.positions} pos · ${fmtN(x.contracts)}` : '', x.orders ? `${x.orders} bid${x.orders === 1 ? '' : 's'}` : ''].filter(Boolean).join(' · ')}</small></button>`).join('')}</div></div>`;
+      }
+    }
+
     const dots = ctx ? `<span class="dots" title="${nPos} subaccounts with positions, ${nOrd} with orders on this event">${'<i class="dot p"></i>'.repeat(nPos)}${'<i class="dot o"></i>'.repeat(nOrd)}</span>` : '<span style="margin-left:auto"></span>';
     const v = view();
-    const busy = v === 'history' ? hist.loading : v === 'canceled' ? canc.loading : state.loading;
+    const busy = v === 'history' ? hist.loading : v === 'canceled' ? canc.loading : ctx ? state.loading : ov.loading;
 
     const isOpen = root.classList.contains('open') || root.classList.contains('pinned');
     const prevBox = root.firstElementChild;
@@ -633,9 +761,9 @@
       ${oldCopy ? `<div class="stale">An <b>old copy</b> of this script is still installed. Open the Tampermonkey Dashboard and delete <b>"Kalshi Quick Subaccount Switcher + Market Orders"</b> (or any other older Subaccount Switcher).</div>` : ''}
       ${stale ? `<div class="stale">Subaccount changed to <b>${esc(subName(cur))}</b> in another tab — this page may still be trading on <b>${esc(subName(staleFrom))}</b>. <a data-act="reload">Reload</a></div>` : ''}
       <div class="body">${isPaused() ? '<div class="note">Kalshi rate-limited us — auto-refresh paused for a moment.</div>' : ''}${jump}<div class="grid">${subBtns}</div>
-        <div class="tabs"><a data-view="market" class="${v === 'market' ? 'on' : ''}">This market</a><a data-view="pnl" class="${v === 'pnl' ? 'on' : ''}">P&amp;L</a><a data-view="canceled" class="${v === 'canceled' ? 'on' : ''}">Canceled</a><a data-view="history" class="${v === 'history' ? 'on' : ''}">History</a>
+        <div class="tabs"><a data-view="market" class="${v === 'market' ? 'on' : ''}">${ctx ? 'This market' : categoryContext() ? 'This category' : 'Open activity'}</a><a data-view="pnl" class="${v === 'pnl' ? 'on' : ''}">P&amp;L</a><a data-view="canceled" class="${v === 'canceled' ? 'on' : ''}">Canceled</a><a data-view="history" class="${v === 'history' ? 'on' : ''}">History</a>
           <span class="sp"></span><a class="rf" data-act="refresh">${busy ? 'loading…' : 'refresh'}</a></div>
-        <div class="view">${v === 'history' ? historyView(ctx) : v === 'pnl' ? pnlView(ctx) : v === 'canceled' ? canceledView(ctx) : marketView(ctx)}</div>
+        <div class="view">${v === 'history' ? historyView(ctx) : v === 'pnl' ? pnlView(ctx) : v === 'canceled' ? canceledView(ctx) : ctx ? marketView(ctx) : overviewView(res)}</div>
       </div></div>`;
     // Never shrink under the cursor while open (that used to close the panel).
     if (isOpen && root._minH) root.firstElementChild.style.minHeight = root._minH + 'px';
@@ -703,17 +831,18 @@
     if (!a) return;
     if (a.dataset.act === 'pin') togglePin();
     if (a.dataset.act === 'reload') location.reload();
-    if (a.dataset.act === 'dismiss') { jumpDismissedFor = state.ctxKey; render(); }
+    if (a.dataset.act === 'dismiss') { jumpDismissedFor = marketContext() ? state.ctxKey : 'ov|' + location.pathname; render(); }
     if (a.dataset.act === 'refresh') {
       if (view() === 'history') loadHistory(true);
       else if (view() === 'canceled') loadCanceled(true);
+      else if (!marketContext()) loadOverview(true);
       else { refresh(true); if (view() === 'pnl') loadSettlements(true); }
     }
   }, true);
   document.addEventListener('change', (e) => {
     if (!root || !root.contains(e.target)) return;
     const opt = e.target.dataset && e.target.dataset.opt;
-    if (opt) { lsSet(opt, e.target.checked ? '1' : '0'); if (opt === HIST_MKT_KEY) loadHistory(true); else render(); }
+    if (opt) { lsSet(opt, e.target.checked ? '1' : '0'); if (opt === HIST_MKT_KEY) loadHistory(true); else if (opt === 'ksw-cat-only') loadCategories().then(render); else render(); }
   }, true);
 
   // If another tab switches subaccount, this tab's trading UI may still be on the old one.
@@ -772,24 +901,31 @@
     if (!root || !(root.classList.contains('open') || root.classList.contains('pinned'))) return;
     if (onOpen && Date.now() - lastTick < 20000) return;   // just refreshed; don't refetch on every hover
     lastTick = Date.now();
-    if (marketContext()) refresh(true);
+    if (marketContext()) refresh(true); else loadOverview(true);
     if (view() === 'history') loadHistory(true);
   }
 
   function start() {
     build();
-    refresh(true);                          // one load per market so the ⚡ indicator is right
+    if (marketContext()) refresh(true);    // one load per page so the ⚡ indicator is right
+    else loadOverview(true);
     lastTick = Date.now();
     learnNames();
     setInterval(learnNames, 1500);
     sweepOldCopies();
     setInterval(sweepOldCopies, 1000);
+    let lastSeries = 0;
+    setInterval(() => {                     // category pages add markets as you scroll — re-match (no requests)
+      if (!categoryContext() || !ov.bySub) return;
+      const n = seriesOnPage().size;
+      if (n !== lastSeries) { lastSeries = n; render(); }
+    }, 2000);
     let last = location.href, navTimer = null;               // Kalshi is a SPA — watch for in-app navigation
     setInterval(() => {
       if (location.href !== last) {
         last = location.href;
         clearTimeout(navTimer);
-        navTimer = setTimeout(() => refresh(false), 1200);   // wait until you settle on a market
+        navTimer = setTimeout(() => { if (marketContext()) refresh(false); else { render(); loadOverview(false).then(() => loadCategories()).then(render); } }, 1200);   // wait until you settle on a page
         if (view() === 'history' && histMarketOnly()) setTimeout(() => loadHistory(false), 1500);
       }
     }, 400);

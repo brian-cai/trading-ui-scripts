@@ -10,6 +10,7 @@ Updates are picked up automatically via `@updateURL`.
 - One-click / Alt+Shift+0–9 subaccount switching
 - On a market page: resting orders and positions on that event across all subaccounts
 - Prompt (inside the panel) to jump to a subaccount that has activity on the current market
+- On category pages (e.g. /category/elections): open positions and resting bids per subaccount in that category, with suggestions of which subaccount to switch to
 - Canceled view: canceled orders on the current market (including Kalshi's archive for resolved markets), current subaccount or all
 - History view: recent fills for the current subaccount, with an "All subaccounts" toggle
 
