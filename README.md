@@ -12,3 +12,7 @@ Updates are picked up automatically via `@updateURL`.
 - Prompt to jump to a subaccount that has activity on the current market
 
 Subaccount names are read from the site's Sub accounts page and stored only in your browser.
+
+## shard-balances.user.js
+
+Hover panel (bottom-left) showing cash on each exchange shard — General, Combos, Crypto/Commodities, Sports — for every subaccount, with per-shard and overall totals. Click a row to switch to that subaccount; click the header to pin it open.
