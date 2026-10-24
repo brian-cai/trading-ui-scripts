@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Subaccount Switcher
 // @namespace    trading-ui-scripts
-// @version      1.5
+// @version      1.6
 // @description  Fast subaccount switching, resting orders / positions on the current market across all subaccounts, and per-subaccount fill history.
 // @match        https://kalshi.com/*
 // @run-at       document-start
@@ -122,25 +122,48 @@
   // ---------- Market data (orders + positions per subaccount) ----------
   async function loadSub(n, ctx) {
     const q = ctx.event ? 'event_ticker=' + encodeURIComponent(ctx.event) : 'ticker=' + encodeURIComponent(ctx.market);
-    const [o, p] = await Promise.allSettled([
+    const [o, p, st] = await Promise.allSettled([
       api(`/portfolio/orders?status=resting&limit=200&subaccount=${n}&${q}`),
-      api(`/portfolio/positions?limit=200&count_filter=position&subaccount=${n}&${q}`),
+      // settlement_status=all + total_traded: includes flat and settled markets, for P&L on closed markets
+      api(`/portfolio/positions?limit=200&count_filter=total_traded&settlement_status=all&subaccount=${n}&${q}`),
+      api(`/portfolio/settlements?limit=200&subaccount=${n}&${q}`),
     ]);
-    const orders = o.status === 'fulfilled' ? (o.value.orders || []) : null;
-    let positions = p.status === 'fulfilled' ? (p.value.market_positions || []) : null;
-    if (positions) positions = positions.filter((x) => num(x.position, x.position_fp) !== 0);
     // If the API ignores the subaccount param and returns everything, filter by field when present.
     const keep = (x) => {
       const s = x.subaccount ?? x.subaccount_number;
       return s === undefined || s === null || Number(s) === n;
     };
+    const orders = o.status === 'fulfilled' ? (o.value.orders || []).filter(keep) : null;
+    const traded = p.status === 'fulfilled' ? (p.value.market_positions || []).filter(keep) : null;
+    const positions = traded && traded.filter((x) => num(x.position, x.position_fp) !== 0);
+    const settlements = st.status === 'fulfilled' ? (st.value.settlements || []).filter(keep) : [];
     return {
-      n,
-      orders: orders && orders.filter(keep),
-      positions: positions && positions.filter(keep),
+      n, orders, positions, traded, settlements,
       error: o.status === 'rejected' ? o.reason.message : (p.status === 'rejected' ? p.reason.message : null),
     };
   }
+
+  // Per-market P&L for one subaccount: realized trading P&L from positions, plus the
+  // settlement result (payout − cost of contracts held at settlement − fees) when settled.
+  function pnlFor(r) {
+    const out = { traded: 0, realized: 0, settle: 0, fees: 0, settled: false, result: null, any: false, total: 0 };
+    if (!r) return out;
+    for (const p of r.traded || []) {
+      out.any = true;
+      out.traded += num(p.total_traded_dollars, p.total_traded != null ? p.total_traded / 100 : null);
+      out.realized += num(p.realized_pnl_dollars, p.realized_pnl != null ? p.realized_pnl / 100 : null);
+      out.fees += num(p.fees_paid_dollars, p.fees_paid != null ? p.fees_paid / 100 : null);
+    }
+    for (const s of r.settlements || []) {
+      out.any = true; out.settled = true; out.result = s.market_result || out.result;
+      const cost = num(s.yes_total_cost_dollars, s.yes_total_cost != null ? s.yes_total_cost / 100 : null)
+                 + num(s.no_total_cost_dollars, s.no_total_cost != null ? s.no_total_cost / 100 : null);
+      out.settle += num(s.revenue) / 100 - cost - num(s.fee_cost);
+    }
+    out.total = out.realized + out.settle;
+    return out;
+  }
+  const pnlStr = (v) => (v >= 0 ? '+' : '−') + '$' + Math.abs(v).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
 
   function summarize(r) {
     const out = { orders: 0, positions: 0, contracts: 0, yes: 0, no: 0, exposure: null };
@@ -264,6 +287,16 @@
   #ksw .hl td{background:#1f2a1f}
   #ksw .muted{color:#7d8995}
   #ksw .err{color:#ff8a8a}
+  #ksw .t-up{background:#12391f;color:#5fe39a;border-radius:4px;padding:0 4px}
+  #ksw .t-dn{background:#3d1717;color:#ff8a8a;border-radius:4px;padding:0 4px}
+  #ksw .up{color:#2fd27f}#ksw .dn{color:#ff6b6b}
+  #ksw tr.go{cursor:pointer}
+  #ksw tr.go:hover td{background:#1c232b}
+  #ksw tr.me td{background:#123326}
+  #ksw th{color:#9aa6b2;font-weight:600;font-size:11px;text-align:right;padding:2px 4px;border-bottom:1px solid #2b323a;white-space:nowrap}
+  #ksw th:first-child,#ksw .pl td:first-child{text-align:left}
+  #ksw .pl td{text-align:right}
+  #ksw .pl tfoot td{font-weight:700;border-top:1px solid #2b323a;border-bottom:0}
   `;
 
   let root, state = { ctxKey: null, results: {}, loading: false, err: null }, jumpDismissedFor = null;
@@ -307,8 +340,24 @@
     }
     const errs = SUBACCOUNTS.map((s) => res[s.n] && res[s.n].error ? `${s.name}: ${res[s.n].error}` : null).filter(Boolean);
     return `${state.err ? `<div class="err">${esc(state.err)}</div>` : ''}
-      ${rows.length ? `<table>${rows.join('')}</table>` : (state.loading ? '<div class="muted">Loading…</div>' : '<div class="muted">No resting orders or positions on this event in any subaccount.</div>')}
+      ${rows.length ? `<table>${rows.join('')}</table>` : (state.loading ? '<div class="muted">Loading…</div>' : (SUBACCOUNTS.some((s) => pnlFor(res[s.n]).any) ? '<div class="muted">Nothing open on this event. <a data-view="pnl" style="color:#7cc4ff;cursor:pointer">See P&amp;L by subaccount →</a></div>' : '<div class="muted">No resting orders or positions on this event in any subaccount.</div>'))}
       ${errs.length ? `<div class="err">${errs.map(esc).join('<br>')}</div>` : ''}`;
+  }
+
+  function pnlView(ctx) {
+    if (!ctx) return '<div class="muted">Open a market to see each subaccount\'s P&amp;L on it.</div>';
+    const res = state.results, cur = currentSub();
+    const rows = SUBACCOUNTS.map((s) => ({ s, ...pnlFor(res[s.n]), held: summarize(res[s.n]).contracts })).filter((x) => x.any);
+    if (!rows.length) return state.loading ? '<div class="muted">Loading…</div>' : '<div class="muted">No subaccount has traded this event.</div>';
+    const tot = rows.reduce((a, x) => ({ traded: a.traded + x.traded, realized: a.realized + x.realized, settle: a.settle + x.settle, total: a.total + x.total }), { traded: 0, realized: 0, settle: 0, total: 0 });
+    const settledAny = rows.some((x) => x.settled);
+    const cell = (v) => `<td class="${v > 0 ? 'up' : v < 0 ? 'dn' : 'muted'}">${pnlStr(v)}</td>`;
+    const result = rows.find((x) => x.result);
+    return `${result ? `<div class="muted" style="margin-bottom:4px">Market result: <b>${esc(String(result.result).toUpperCase())}</b></div>` : ''}
+      <table class="pl"><thead><tr><th>Subaccount</th><th>Traded</th>${settledAny ? '<th>Trading</th><th>Settlement</th>' : '<th>Realized</th>'}<th>P&amp;L</th></tr></thead><tbody>` +
+      rows.map((x) => `<tr class="go ${x.s.n === cur ? 'me' : ''}" data-n="${x.s.n}" title="Click to switch to ${esc(x.s.name)}${x.held ? ' · still holding ' + fmtN(x.held) + ' contracts' : ''}">
+        <td class="s">${esc(x.s.name)}</td><td>$${fmtN(Math.round(x.traded * 100) / 100)}</td>${settledAny ? cell(x.realized) + cell(x.settle) : cell(x.realized)}${cell(x.total)}</tr>`).join('') +
+      `</tbody><tfoot><tr><td>All</td><td>$${fmtN(Math.round(tot.traded * 100) / 100)}</td>${settledAny ? cell(tot.realized) + cell(tot.settle) : cell(tot.realized)}${cell(tot.total)}</tr></tfoot></table>`;
   }
 
   function historyView(ctx) {
@@ -348,22 +397,26 @@
       if (x.contracts) nPos++;
       const posTag = x.contracts ? `<span class="t-p">${esc(tagText({ ...x, orders: 0 })[0])}</span>` : '';
       const ordTag = x.orders ? `<span class="t-o">${x.orders} ord</span>` : '';
+      const pl = pnlFor(res[s.n]);
+      const plTag = !x.orders && !x.contracts && pl.any && Math.abs(pl.total) >= 0.005 ? `<span class="${pl.total >= 0 ? 't-up' : 't-dn'}">${pnlStr(pl.total)}</span>` : '';
       const title = res[s.n] ? ` — ${x.orders} resting orders, ${fmtN(x.contracts)} contracts held on this event` : '';
       return `<button class="sub ${s.n === cur ? 'active' : ''} ${x.orders ? 'ord' : ''} ${x.contracts ? 'pos' : ''}" data-n="${s.n}" title="${s.n}: ${esc(s.name)}${title}">
-        <span class="nm">${s.n <= 9 && HOTKEYS ? `<span class="muted">${s.n}</span> ` : ''}${esc(s.name)}</span><span class="tags">${posTag}${ordTag}</span></button>`;
+        <span class="nm">${s.n <= 9 && HOTKEYS ? `<span class="muted">${s.n}</span> ` : ''}${esc(s.name)}</span><span class="tags">${posTag}${ordTag}${plTag}</span></button>`;
     }).join('');
 
     // "Jump to" — current subaccount has nothing here but others do
     let jump = '', alert = '';
     if (ctx && !state.loading && Object.keys(res).length && jumpDismissedFor !== state.ctxKey) {
       const mine = summarize(res[cur]);
-      const others = SUBACCOUNTS.filter((s) => s.n !== cur).map((s) => ({ s, ...summarize(res[s.n]) })).filter((x) => x.orders + x.positions > 0);
+      const others = SUBACCOUNTS.filter((s) => s.n !== cur)
+        .map((s) => ({ s, ...summarize(res[s.n]), pl: pnlFor(res[s.n]) }))
+        .filter((x) => x.orders + x.positions > 0 || x.pl.any);
       if (others.length) {
-        const mineEmpty = mine.orders + mine.positions === 0;
+        const mineEmpty = mine.orders + mine.positions === 0 && !pnlFor(res[cur]).any;
         alert = `<span class="alert" title="Other subaccounts have activity on this market">⚡ ${others.length}</span>`;
         const lbl = mineEmpty ? `Nothing here on <b>${esc(subName(cur))}</b> — switch to:` : `Also active on:`;
         jump = `<div class="jump"><div class="lbl">${lbl} <a data-act="dismiss" class="muted" style="float:right;cursor:pointer" title="Hide for this market">✕</a></div>
-          <div class="btns">${others.map((x) => `<button data-jump="${x.s.n}">${esc(x.s.name)} <small>${tagText(x).join(' · ')}</small></button>`).join('')}</div></div>`;
+          <div class="btns">${others.map((x) => `<button data-jump="${x.s.n}">${esc(x.s.name)} <small>${(tagText(x).length ? tagText(x) : [pnlStr(x.pl.total) + ' P&amp;L']).join(' · ')}</small></button>`).join('')}</div></div>`;
       }
     }
 
@@ -374,9 +427,9 @@
     root.innerHTML = `<div class="box">
       <div class="hdr" data-act="pin" title="Hover to open · click to pin open"><span class="cur">${cur} · ${esc(subName(cur))}</span>${alert}${dots}<span class="pin">${root.classList.contains('pinned') ? '📌' : '▴'}</span></div>
       <div class="body">${jump}<div class="grid">${subBtns}</div>
-        <div class="tabs"><a data-view="market" class="${v === 'market' ? 'on' : ''}">This market</a><a data-view="history" class="${v === 'history' ? 'on' : ''}">History</a>
+        <div class="tabs"><a data-view="market" class="${v === 'market' ? 'on' : ''}">This market</a><a data-view="pnl" class="${v === 'pnl' ? 'on' : ''}">P&amp;L</a><a data-view="history" class="${v === 'history' ? 'on' : ''}">History</a>
           <span class="sp"></span><a class="rf" data-act="refresh">${busy ? 'loading…' : 'refresh'}</a></div>
-        <div class="view">${v === 'history' ? historyView(ctx) : marketView(ctx)}</div>
+        <div class="view">${v === 'history' ? historyView(ctx) : v === 'pnl' ? pnlView(ctx) : marketView(ctx)}</div>
       </div></div>`;
   }
 
@@ -403,6 +456,8 @@
     if (!root || !root.contains(e.target)) return;
     const j = e.target.closest('[data-jump]');
     if (j) { switchTo(Number(j.dataset.jump)); return; }
+    const pr = e.target.closest('tr.go');
+    if (pr) { switchTo(Number(pr.dataset.n)); return; }
     const b = e.target.closest('button.sub');
     if (b) { switchTo(Number(b.dataset.n)); return; }
     const tab = e.target.closest('[data-view]');
