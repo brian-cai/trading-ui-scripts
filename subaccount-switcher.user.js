@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Subaccount Switcher
 // @namespace    trading-ui-scripts
-// @version      2.2
-// @description  Fast subaccount switching, resting orders / positions on the current market across all subaccounts, and per-subaccount fill history.
+// @version      2.3
+// @description  Fast subaccount switching, resting orders / positions / P&L / canceled orders on the current market across all subaccounts, and per-subaccount fill history.
 // @match        https://kalshi.com/*
 // @run-at       document-start
 // @grant        none
@@ -274,6 +274,73 @@
       : d.toLocaleDateString([], { month: 'short', day: 'numeric' }) + ' ' + d.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
   }
 
+
+  // ---------- Canceled orders ----------
+  // Recent cancels come from the normal orders endpoint (one call covers every subaccount);
+  // cancels older than Kalshi's archive cutoff come from /historical/orders, which can only
+  // filter by market ticker, so we search the archive for the markets you traded/ordered on.
+  const canc = { key: null, rows: null, loading: false, err: null, note: null };
+  const MAX_ARCHIVE_MARKETS = 8;
+  async function pagedOrders(pathBase, maxPages) {
+    const out = []; let cursor = '';
+    for (let i = 0; i < maxPages; i++) {
+      const j = await api(pathBase + (cursor ? '&cursor=' + encodeURIComponent(cursor) : ''));
+      out.push(...(j.orders || []));
+      cursor = j.cursor || '';
+      if (!cursor) break;
+    }
+    return out;
+  }
+  async function loadCanceled(force) {
+    const ctx = marketContext();
+    if (!ctx) return;
+    const key = state.ctxKey;
+    if (!force && canc.key === key && canc.rows) return;
+    canc.key = key; canc.loading = true; canc.err = null; canc.note = null; render();
+    try {
+      if (!(await waitForHeaders())) throw new Error('Waiting for Kalshi to load — try refresh.');
+      const q = ctx.market ? 'ticker=' + encodeURIComponent(ctx.market) : 'event_ticker=' + encodeURIComponent(ctx.event);
+      const rows = [];
+      const seen = new Set();
+      const add = (o, archived) => {
+        if (String(o.status || '').toLowerCase() !== 'canceled') return;
+        const id = o.order_id || JSON.stringify([o.ticker, o.created_time, o.last_update_time, o.subaccount_number]);
+        if (seen.has(id)) return; seen.add(id);
+        const n = Math.trunc(Number(o.subaccount_number ?? o.subaccount ?? 0));
+        rows.push({ ...o, _n: Number.isFinite(n) ? n : 0, _archived: archived });
+      };
+      // 1) Recent cancels, all subaccounts in one go.
+      (await pagedOrders(`/portfolio/orders?status=canceled&limit=200&${q}`, 3)).forEach((o) => add(o, false));
+      // 2) Archive, per market ticker.
+      let tickers;
+      if (ctx.market) tickers = [ctx.market];
+      else {
+        const t = new Set();
+        for (const r of Object.values(state.results)) {
+          for (const p of r.traded || []) if (p.ticker) t.add(p.ticker);
+          for (const o of r.orders || []) if (o.ticker) t.add(o.ticker);
+        }
+        rows.forEach((o) => o.ticker && t.add(o.ticker));
+        tickers = [...t];
+      }
+      if (tickers.length > MAX_ARCHIVE_MARKETS) {
+        canc.note = `Archive searched for ${MAX_ARCHIVE_MARKETS} of ${tickers.length} markets — open a specific outcome to search the rest.`;
+        tickers = tickers.slice(0, MAX_ARCHIVE_MARKETS);
+      } else if (!ctx.market && !tickers.length) {
+        canc.note = 'Open a specific outcome to also search Kalshi\'s archive for older cancels.';
+      }
+      for (const t of tickers) {
+        try { (await pagedOrders(`/historical/orders?limit=200&ticker=${encodeURIComponent(t)}`, 2)).forEach((o) => add(o, true)); }
+        catch (e) { if (!/^404/.test(e.message)) canc.note = 'Archive lookup failed: ' + e.message; }
+      }
+      rows.sort((a, b) => String(b.last_update_time || b.created_time || '').localeCompare(String(a.last_update_time || a.created_time || '')));
+      if (canc.key === key) canc.rows = rows;
+    } catch (e) {
+      if (canc.key === key) canc.err = e.message;
+    }
+    if (canc.key === key) { canc.loading = false; render(); }
+  }
+
   // ---------- UI ----------
   const css = `
   #ksw{order:2;font:12px/1.35 -apple-system,Segoe UI,Roboto,sans-serif;color:#e8ecef}
@@ -390,8 +457,8 @@
     for (const s of SUBACCOUNTS) {
       const r = res[s.n]; if (!r) continue;
       for (const o of r.orders || []) {
-        const side = (o.side || '').toLowerCase();
-        const px = priceCents(o);
+        const side = String(o.outcome_side || o.side || '').toLowerCase();
+        const px = priceCents({ ...o, side });
         const hl = ctx.market && o.ticker === ctx.market;
         rows.push(`<tr class="${hl ? 'hl' : ''}"><td class="s">${esc(s.name)}</td><td class="tk">${esc(shortTicker(o.ticker, ctx.event))}</td>
           <td>${esc((o.action || 'buy').toUpperCase())} <span class="${sideCls(side)}">${esc(side.toUpperCase())}</span></td>
@@ -424,6 +491,29 @@
       rows.map((x) => `<tr class="go ${x.s.n === cur ? 'me' : ''}" data-n="${x.s.n}" title="Click to switch to ${esc(x.s.name)}${x.held ? ' · still holding ' + fmtN(x.held) + ' contracts' : ''}">
         <td class="s">${esc(x.s.name)}</td><td>$${fmtN(Math.round(x.traded * 100) / 100)}</td>${settledAny ? cell(x.realized) + cell(x.settle) : cell(x.realized)}${cell(x.total)}</tr>`).join('') +
       `</tbody><tfoot><tr><td>All</td><td>$${fmtN(Math.round(tot.traded * 100) / 100)}</td>${settledAny ? cell(tot.realized) + cell(tot.settle) : cell(tot.realized)}${cell(tot.total)}</tr></tfoot></table>`;
+  }
+
+  function canceledView(ctx) {
+    if (!ctx) return '<div class="muted">Open a market to see canceled orders on it.</div>';
+    const all = lsGet('ksw-canc-all', '0') === '1';
+    const cur = currentSub();
+    const opts = `<div class="opts"><label title="Show cancels from every subaccount, not just the current one"><input type="checkbox" data-opt="ksw-canc-all" ${all ? 'checked' : ''}> All subaccounts</label></div>`;
+    const list = (canc.rows || []).filter((o) => all || o._n === cur);
+    let body;
+    if (!canc.rows) body = canc.loading ? '<div class="muted">Loading…</div>' : '';
+    else if (!list.length) body = `<div class="muted">No canceled orders on this ${ctx.market ? 'market' : 'event'}${all ? '' : ' for ' + esc(subName(cur))}.</div>`;
+    else body = `<table>${list.map((o) => {
+      const side = String(o.outcome_side || o.side || '').toLowerCase();
+      const action = String(o.action || (o.book_side === 'ask' ? 'sell' : 'buy')).toUpperCase();
+      const px = priceCents({ ...o, side });
+      const init = num(o.initial_count_fp, o.initial_count), filled = num(o.fill_count_fp, o.fill_count);
+      return `<tr title="${o._archived ? 'From Kalshi\'s archive' : ''}"><td class="t">${esc(fmtTime(o.last_update_time || o.created_time))}</td>${all ? `<td class="s">${esc(subName(o._n))}</td>` : ''}
+        <td class="tk" title="${esc(o.ticker)}">${esc(shortTicker(o.ticker, ctx.event))}</td>
+        <td>${esc(action)} <span class="${sideCls(side)}">${esc(side.toUpperCase())}</span></td>
+        <td>${fmtN(init)} @ ${px != null ? px + '¢' : '?'}</td>
+        <td class="muted">${filled ? fmtN(filled) + ' filled' : ''}${o._archived ? ' · archived' : ''}</td></tr>`;
+    }).join('')}</table>`;
+    return opts + (canc.err ? `<div class="err">${esc(canc.err)}</div>` : '') + (canc.note ? `<div class="muted" style="margin-bottom:4px">${esc(canc.note)}</div>` : '') + body;
   }
 
   function historyView(ctx) {
@@ -490,7 +580,7 @@
 
     const dots = ctx ? `<span class="dots" title="${nPos} subaccounts with positions, ${nOrd} with orders on this event">${'<i class="dot p"></i>'.repeat(nPos)}${'<i class="dot o"></i>'.repeat(nOrd)}</span>` : '<span style="margin-left:auto"></span>';
     const v = view();
-    const busy = v === 'history' ? hist.loading : state.loading;
+    const busy = v === 'history' ? hist.loading : v === 'canceled' ? canc.loading : state.loading;
 
     const isOpen = root.classList.contains('open') || root.classList.contains('pinned');
     const prevBox = root.firstElementChild;
@@ -499,9 +589,9 @@
       <div class="hdr" data-act="pin" title="Hover to open · click to pin open"><span class="cur">${cur} · ${esc(subName(cur))}</span>${alert}${dots}<span class="pin">${root.classList.contains('pinned') ? '📌' : '▴'}</span></div>
       ${stale ? `<div class="stale">Subaccount changed to <b>${esc(subName(cur))}</b> in another tab — this page may still be trading on <b>${esc(subName(staleFrom))}</b>. <a data-act="reload">Reload</a></div>` : ''}
       <div class="body">${isPaused() ? '<div class="note">Kalshi rate-limited us — auto-refresh paused for a moment.</div>' : ''}${jump}<div class="grid">${subBtns}</div>
-        <div class="tabs"><a data-view="market" class="${v === 'market' ? 'on' : ''}">This market</a><a data-view="pnl" class="${v === 'pnl' ? 'on' : ''}">P&amp;L</a><a data-view="history" class="${v === 'history' ? 'on' : ''}">History</a>
+        <div class="tabs"><a data-view="market" class="${v === 'market' ? 'on' : ''}">This market</a><a data-view="pnl" class="${v === 'pnl' ? 'on' : ''}">P&amp;L</a><a data-view="canceled" class="${v === 'canceled' ? 'on' : ''}">Canceled</a><a data-view="history" class="${v === 'history' ? 'on' : ''}">History</a>
           <span class="sp"></span><a class="rf" data-act="refresh">${busy ? 'loading…' : 'refresh'}</a></div>
-        <div class="view">${v === 'history' ? historyView(ctx) : v === 'pnl' ? pnlView(ctx) : marketView(ctx)}</div>
+        <div class="view">${v === 'history' ? historyView(ctx) : v === 'pnl' ? pnlView(ctx) : v === 'canceled' ? canceledView(ctx) : marketView(ctx)}</div>
       </div></div>`;
     // Never shrink under the cursor while open (that used to close the panel).
     if (isOpen && root._minH) root.firstElementChild.style.minHeight = root._minH + 'px';
@@ -543,6 +633,7 @@
     if (state.ctxKey === myKey) {
       state.results = fresh; state.loading = false; render();
       if (view() === 'pnl') loadSettlements(!sameMarket ? true : false);
+      if (view() === 'canceled' && !sameMarket) loadCanceled(true);
     }
   }
 
@@ -560,6 +651,7 @@
       lsSet('ksw-view', tab.dataset.view);
       if (tab.dataset.view === 'history') loadHistory(false);
       if (tab.dataset.view === 'pnl') loadSettlements(false);
+      if (tab.dataset.view === 'canceled') loadCanceled(false);
       render(); return;
     }
     const a = e.target.closest('[data-act]');
@@ -569,13 +661,14 @@
     if (a.dataset.act === 'dismiss') { jumpDismissedFor = state.ctxKey; render(); }
     if (a.dataset.act === 'refresh') {
       if (view() === 'history') loadHistory(true);
+      else if (view() === 'canceled') loadCanceled(true);
       else { refresh(true); if (view() === 'pnl') loadSettlements(true); }
     }
   }, true);
   document.addEventListener('change', (e) => {
     if (!root || !root.contains(e.target)) return;
     const opt = e.target.dataset && e.target.dataset.opt;
-    if (opt) { lsSet(opt, e.target.checked ? '1' : '0'); loadHistory(true); }
+    if (opt) { lsSet(opt, e.target.checked ? '1' : '0'); if (opt.startsWith('ksw-hist')) loadHistory(true); else render(); }
   }, true);
 
   // If another tab switches subaccount, this tab's trading UI may still be on the old one.
