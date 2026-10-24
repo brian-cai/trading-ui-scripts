@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Subaccount Switcher
 // @namespace    trading-ui-scripts
-// @version      2.1
+// @version      2.2
 // @description  Fast subaccount switching, resting orders / positions on the current market across all subaccounts, and per-subaccount fill history.
 // @match        https://kalshi.com/*
 // @run-at       document-start
@@ -367,7 +367,7 @@
     if (root) return;
     const st = document.createElement('style'); st.textContent = css; document.head.appendChild(st);
     root = document.createElement('div'); root.id = 'ksw';
-    if (lsGet('ksw-pin', '0') === '1') root.classList.add('pinned');
+    if (lsGet('ksw-open', '1') === '1') root.classList.add('pinned');   // open by default
     getDock().appendChild(root);
     makeOpenable(root, () => {
       render();
@@ -378,7 +378,7 @@
 
   function togglePin() {
     root.classList.toggle('pinned');
-    lsSet('ksw-pin', root.classList.contains('pinned') ? '1' : '0');
+    lsSet('ksw-open', root.classList.contains('pinned') ? '1' : '0');
     if (!root.classList.contains('pinned')) root._minH = 0;
     render();
   }
