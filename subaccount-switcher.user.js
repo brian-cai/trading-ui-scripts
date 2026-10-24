@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Subaccount Switcher
 // @namespace    trading-ui-scripts
-// @version      2.3
+// @version      2.5
 // @description  Fast subaccount switching, resting orders / positions / P&L / canceled orders on the current market across all subaccounts, and per-subaccount fill history.
 // @match        https://kalshi.com/*
 // @run-at       document-start
@@ -23,7 +23,6 @@
   const API = 'https://api.elections.kalshi.com/trade-api/v2';
   const LS_KEY = 'kalshi-subaccount';     // where Kalshi's web app stores the active subaccount
   const HOTKEYS = true;                    // Alt+Shift+0..9 switches to subaccount 0..9; Alt+Shift+` pins/unpins
-  const HISTORY_LIMIT = 50;                // fills fetched per subaccount
   // ──────────────────────────────────────────────────────────
 
   function loadSubaccounts() {
@@ -232,33 +231,71 @@
   }
 
   // ---------- History (fills) ----------
-  const hist = { key: null, rows: null, loading: false, err: null };
+  // "This market only" (default on): every fill on this market/event — up to 1,000 recent
+  // fills plus Kalshi's archive for older ones. Otherwise: your most recent fills anywhere.
+  // Fills for all subaccounts are fetched together; the "All subaccounts" box just filters.
+  const hist = { key: null, rows: null, loading: false, err: null, note: null };
+  const HIST_MKT_KEY = 'ksw-hist-market';
+  const histMarketOnly = () => lsGet(HIST_MKT_KEY, '1') === '1';
+  async function pagedFills(pathBase, maxPages) {
+    const out = []; let cursor = '', more = false;
+    for (let i = 0; i < maxPages; i++) {
+      const j = await api(pathBase + (cursor ? '&cursor=' + encodeURIComponent(cursor) : ''));
+      out.push(...(j.fills || []));
+      cursor = j.cursor || '';
+      if (!cursor) break;
+      if (i === maxPages - 1) more = true;
+    }
+    return { fills: out, more };
+  }
   async function loadHistory(force) {
-    const all = lsGet('ksw-hist-all', '0') === '1';
     const ctx = marketContext();
-    const onlyMarket = !!ctx && lsGet('ksw-hist-mkt', '0') === '1';
-    const key = `${all ? 'all' : currentSub()}|${onlyMarket ? (ctx.market || ctx.event) : ''}`;
+    const onlyMarket = !!ctx && histMarketOnly();
+    const key = onlyMarket ? 'mkt|' + state.ctxKey : 'recent';
     if (!force && hist.key === key && hist.rows) return;
-    hist.key = key; hist.loading = true; hist.err = null; render();
+    hist.key = key; hist.loading = true; hist.err = null; hist.note = null; render();
     try {
       if (!(await waitForHeaders())) throw new Error('Waiting for Kalshi to load — try refresh.');
-      const filt = onlyMarket && ctx.market ? `&ticker=${encodeURIComponent(ctx.market)}` : '';
-      const subs = all ? SUBACCOUNTS.map((s) => s.n) : [currentSub()];
-      const rows = [];
-      const errs = [];
-      await Promise.all(subs.map(async (n) => {
-        try {
-          const j = await api(`/portfolio/fills?limit=${HISTORY_LIMIT}&subaccount=${n}${filt}`);
-          for (const f of j.fills || []) {
-            const s = f.subaccount ?? f.subaccount_number;
-            if (s !== undefined && s !== null && Number(s) !== n) continue;
-            if (onlyMarket && !ctx.market && ctx.event && f.ticker && !f.ticker.startsWith(ctx.event)) continue;
-            rows.push({ ...f, _n: n });
+      const rows = [], seen = new Set();
+      const add = (f, archived) => {
+        const id = f.fill_id || f.trade_id || JSON.stringify([f.ticker, f.created_time, f.count_fp, f.order_id]);
+        if (seen.has(id)) return; seen.add(id);
+        const n = Math.trunc(Number(f.subaccount_number ?? f.subaccount ?? 0));
+        rows.push({ ...f, ticker: f.ticker || f.market_ticker, _n: Number.isFinite(n) ? n : 0, _archived: archived });
+      };
+      if (onlyMarket) {
+        let tickers;
+        if (ctx.market) tickers = [ctx.market];
+        else {
+          const t = new Set();
+          for (const r of Object.values(state.results)) for (const p of r.traded || []) if (p.ticker) t.add(p.ticker);
+          tickers = [...t].slice(0, 100);
+        }
+        if (!tickers.length) {
+          hist.note = 'No subaccount has traded this event.';
+        } else {
+          const tq = encodeURIComponent(tickers.join(','));
+          const recent = await pagedFills(`/portfolio/fills?limit=200&ticker=${tq}`, 5);
+          recent.fills.forEach((f) => add(f, false));
+          // Archive: older fills, one market at a time.
+          let archiveErr = null;
+          for (const t of tickers.slice(0, 8)) {
+            try { (await pagedFills(`/historical/fills?limit=200&ticker=${encodeURIComponent(t)}`, 2)).fills.forEach((f) => add(f, true)); }
+            catch (e) { if (!/^404/.test(e.message)) archiveErr = e.message; }
           }
-        } catch (e) { errs.push(`${subName(n)}: ${e.message}`); }
-      }));
+          const notes = [];
+          if (recent.more) notes.push('showing the most recent 1,000 fills plus the archive');
+          if (tickers.length > 8) notes.push(`archive searched for 8 of ${tickers.length} outcomes`);
+          if (archiveErr) notes.push('archive lookup failed: ' + archiveErr);
+          if (notes.length) hist.note = notes.join(' · ');
+        }
+      } else {
+        const recent = await pagedFills(`/portfolio/fills?limit=200`, 1);
+        recent.fills.forEach((f) => add(f, false));
+        hist.note = 'Your 200 most recent fills across all markets.';
+      }
       rows.sort((a, b) => String(b.created_time || '').localeCompare(String(a.created_time || '')));
-      if (hist.key === key) { hist.rows = rows; hist.err = errs.length ? errs.join(' · ') : null; }
+      if (hist.key === key) hist.rows = rows;
     } catch (e) {
       if (hist.key === key) hist.err = e.message;
     }
@@ -343,6 +380,7 @@
 
   // ---------- UI ----------
   const css = `
+  #tus-dock > #ksw{position:static}   /* in case an old copy's styles are still on the page */
   #ksw{order:2;font:12px/1.35 -apple-system,Segoe UI,Roboto,sans-serif;color:#e8ecef}
   #ksw .box{background:#14181d;border:1px solid #2b323a;border-radius:10px;box-shadow:0 8px 30px rgba(0,0,0,.45);overflow:hidden;max-width:440px}
   #ksw .hdr{display:flex;align-items:center;gap:8px;padding:7px 10px;background:#1b2128;cursor:pointer;user-select:none;white-space:nowrap}
@@ -518,24 +556,29 @@
 
   function historyView(ctx) {
     const all = lsGet('ksw-hist-all', '0') === '1';
-    const onlyMkt = lsGet('ksw-hist-mkt', '0') === '1';
+    const onlyMkt = !!ctx && histMarketOnly();
+    const cur = currentSub();
     const opts = `<div class="opts">
       <label title="Include fills from every subaccount, not just the current one"><input type="checkbox" data-opt="ksw-hist-all" ${all ? 'checked' : ''}> All subaccounts</label>
-      ${ctx ? `<label title="Only fills on the market you're viewing"><input type="checkbox" data-opt="ksw-hist-mkt" ${onlyMkt ? 'checked' : ''}> This market only</label>` : ''}
+      ${ctx ? `<label title="All your fills on the market you're viewing, including Kalshi's archive"><input type="checkbox" data-opt="${HIST_MKT_KEY}" ${onlyMkt ? 'checked' : ''}> This market only</label>` : ''}
     </div>`;
+    const list = (hist.rows || []).filter((f) => all || f._n === cur);
     let body;
-    if (hist.loading && !hist.rows) body = '<div class="muted">Loading…</div>';
-    else if (!hist.rows || !hist.rows.length) body = hist.loading ? '<div class="muted">Loading…</div>' : `<div class="muted">No recent fills${all ? '' : ' on ' + esc(subName(currentSub()))}.</div>`;
-    else body = `<table>${hist.rows.map((f) => {
-      const side = (f.side || '').toLowerCase();
-      const px = priceCents(f);
-      const qty = num(f.count, f.count_fp);
-      return `<tr><td class="t">${esc(fmtTime(f.created_time))}</td>${all ? `<td class="s">${esc(subName(f._n))}</td>` : ''}
+    if (!hist.rows) body = hist.loading ? '<div class="muted">Loading…</div>' : '';
+    else if (!list.length) body = `<div class="muted">No fills${onlyMkt ? ' on this ' + (ctx.market ? 'market' : 'event') : ''}${all ? '' : ' for ' + esc(subName(cur))}.</div>`;
+    else body = `<table>${list.map((f) => {
+      const side = String(f.outcome_side || f.side || '').toLowerCase();
+      const action = String(f.action || (f.book_side === 'ask' ? 'sell' : 'buy')).toUpperCase();
+      const px = priceCents({ ...f, side });
+      const qty = num(f.count_fp, f.count);
+      return `<tr title="${f._archived ? 'From Kalshi\'s archive' : ''}"><td class="t">${esc(fmtTime(f.created_time))}</td>${all ? `<td class="s">${esc(subName(f._n))}</td>` : ''}
         <td class="tk" title="${esc(f.ticker)}">${esc(ctx ? shortTicker(f.ticker, ctx.event) : f.ticker)}</td>
-        <td>${esc((f.action || '').toUpperCase())} <span class="${sideCls(side)}">${esc(side.toUpperCase())}</span></td>
-        <td>${qty} @ ${px != null ? px + '¢' : '?'}</td></tr>`;
+        <td>${esc(action)} <span class="${sideCls(side)}">${esc(side.toUpperCase())}</span></td>
+        <td>${fmtN(qty)} @ ${px != null ? px + '¢' : '?'}</td></tr>`;
     }).join('')}</table>`;
-    return opts + (hist.err ? `<div class="err">${esc(hist.err)}</div>` : '') + body;
+    const oldest = list.length ? list[list.length - 1].created_time : null;
+    const cover = list.length ? `<div class="muted" style="margin-bottom:4px">${list.length} fill${list.length === 1 ? '' : 's'}${oldest ? ', back to ' + esc(fmtTime(oldest)) : ''}${hist.note ? ' · ' + esc(hist.note) : ''}</div>` : (hist.note ? `<div class="muted" style="margin-bottom:4px">${esc(hist.note)}</div>` : '');
+    return opts + (hist.err ? `<div class="err">${esc(hist.err)}</div>` : '') + cover + body;
   }
 
   function render() {
@@ -587,6 +630,7 @@
     if (isOpen && prevBox) root._minH = Math.max(root._minH || 0, prevBox.offsetHeight);
     root.innerHTML = `<div class="box">
       <div class="hdr" data-act="pin" title="Hover to open · click to pin open"><span class="cur">${cur} · ${esc(subName(cur))}</span>${alert}${dots}<span class="pin">${root.classList.contains('pinned') ? '📌' : '▴'}</span></div>
+      ${oldCopy ? `<div class="stale">An <b>old copy</b> of this script is still installed. Open the Tampermonkey Dashboard and delete <b>"Kalshi Quick Subaccount Switcher + Market Orders"</b> (or any other older Subaccount Switcher).</div>` : ''}
       ${stale ? `<div class="stale">Subaccount changed to <b>${esc(subName(cur))}</b> in another tab — this page may still be trading on <b>${esc(subName(staleFrom))}</b>. <a data-act="reload">Reload</a></div>` : ''}
       <div class="body">${isPaused() ? '<div class="note">Kalshi rate-limited us — auto-refresh paused for a moment.</div>' : ''}${jump}<div class="grid">${subBtns}</div>
         <div class="tabs"><a data-view="market" class="${v === 'market' ? 'on' : ''}">This market</a><a data-view="pnl" class="${v === 'pnl' ? 'on' : ''}">P&amp;L</a><a data-view="canceled" class="${v === 'canceled' ? 'on' : ''}">Canceled</a><a data-view="history" class="${v === 'history' ? 'on' : ''}">History</a>
@@ -634,6 +678,7 @@
       state.results = fresh; state.loading = false; render();
       if (view() === 'pnl') loadSettlements(!sameMarket ? true : false);
       if (view() === 'canceled' && !sameMarket) loadCanceled(true);
+      if (view() === 'history' && histMarketOnly() && !sameMarket) loadHistory(true);
     }
   }
 
@@ -668,7 +713,7 @@
   document.addEventListener('change', (e) => {
     if (!root || !root.contains(e.target)) return;
     const opt = e.target.dataset && e.target.dataset.opt;
-    if (opt) { lsSet(opt, e.target.checked ? '1' : '0'); if (opt.startsWith('ksw-hist')) loadHistory(true); else render(); }
+    if (opt) { lsSet(opt, e.target.checked ? '1' : '0'); if (opt === HIST_MKT_KEY) loadHistory(true); else render(); }
   }, true);
 
   // If another tab switches subaccount, this tab's trading UI may still be on the old one.
@@ -708,6 +753,19 @@
     render();
   }
 
+  // Older versions of this script drew a bar at the top of the page. If an old copy is still
+  // installed alongside this one, hide its bar and say so, so it can be deleted.
+  let oldCopy = false;
+  function sweepOldCopies() {
+    const top = document.getElementById('ksw-top');
+    if (top) top.remove();
+    const dupes = [...document.querySelectorAll('#ksw')].filter((el) => el !== root);
+    dupes.forEach((el) => { el.style.display = 'none'; });
+    const was = oldCopy;
+    oldCopy = oldCopy || !!top || dupes.length > 0;
+    if (oldCopy !== was) render();
+  }
+
   let lastTick = 0;
   function backgroundTick(onOpen) {
     if (document.hidden || isPaused()) return;
@@ -724,13 +782,15 @@
     lastTick = Date.now();
     learnNames();
     setInterval(learnNames, 1500);
+    sweepOldCopies();
+    setInterval(sweepOldCopies, 1000);
     let last = location.href, navTimer = null;               // Kalshi is a SPA — watch for in-app navigation
     setInterval(() => {
       if (location.href !== last) {
         last = location.href;
         clearTimeout(navTimer);
         navTimer = setTimeout(() => refresh(false), 1200);   // wait until you settle on a market
-        if (view() === 'history' && lsGet('ksw-hist-mkt', '0') === '1') loadHistory(false);
+        if (view() === 'history' && histMarketOnly()) setTimeout(() => loadHistory(false), 1500);
       }
     }, 400);
     // Background refresh: only while the panel is open/pinned and the tab is visible.
