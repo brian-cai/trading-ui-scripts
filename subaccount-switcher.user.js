@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Subaccount Switcher
 // @namespace    trading-ui-scripts
-// @version      1.4
+// @version      1.5
 // @description  Fast subaccount switching, resting orders / positions on the current market across all subaccounts, and per-subaccount fill history.
 // @match        https://kalshi.com/*
 // @run-at       document-start
@@ -358,9 +358,11 @@
     if (ctx && !state.loading && Object.keys(res).length && jumpDismissedFor !== state.ctxKey) {
       const mine = summarize(res[cur]);
       const others = SUBACCOUNTS.filter((s) => s.n !== cur).map((s) => ({ s, ...summarize(res[s.n]) })).filter((x) => x.orders + x.positions > 0);
-      if (mine.orders + mine.positions === 0 && others.length) {
+      if (others.length) {
+        const mineEmpty = mine.orders + mine.positions === 0;
         alert = `<span class="alert" title="Other subaccounts have activity on this market">⚡ ${others.length}</span>`;
-        jump = `<div class="jump"><div class="lbl">Nothing here on <b>${esc(subName(cur))}</b> — switch to: <a data-act="dismiss" class="muted" style="float:right;cursor:pointer" title="Hide for this market">✕</a></div>
+        const lbl = mineEmpty ? `Nothing here on <b>${esc(subName(cur))}</b> — switch to:` : `Also active on:`;
+        jump = `<div class="jump"><div class="lbl">${lbl} <a data-act="dismiss" class="muted" style="float:right;cursor:pointer" title="Hide for this market">✕</a></div>
           <div class="btns">${others.map((x) => `<button data-jump="${x.s.n}">${esc(x.s.name)} <small>${tagText(x).join(' · ')}</small></button>`).join('')}</div></div>`;
       }
     }
