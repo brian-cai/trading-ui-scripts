@@ -18,4 +18,4 @@ Subaccount names are read from the site's Sub accounts page and stored only in y
 
 ## shard-balances.user.js
 
-Hover panel (stacked above the switcher, bottom-right) for the **active subaccount**: each exchange shard (General, Combos, Crypto/Commodities, Sports) with its available cash, the estimated value of open positions on that shard (contracts × mid price), and the total. The footer shows unrealized P&L vs cost. Click the header to pin it open.
+Hover panel (bottom-right corner, under the switcher: the short panel sits in the corner so the tall switcher growing or shrinking never moves it under the cursor) for the **active subaccount**: each exchange shard (General, Combos, Crypto/Commodities, Sports) with its available cash, the estimated value of open positions on that shard (contracts × mid price), and the total. The footer shows unrealized P&L vs cost. Click the header to pin it open.

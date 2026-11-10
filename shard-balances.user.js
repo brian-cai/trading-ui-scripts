@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Shard Balances
 // @namespace    trading-ui-scripts
-// @version      3.1
+// @version      3.2
 // @description  Hover panel showing, for the active subaccount, cash and estimated position value on each exchange shard.
 // @match        https://kalshi.com/*
 // @run-at       document-start
@@ -181,7 +181,7 @@
   // ---------- UI ----------
   const css = `
   #tus-dock > #ksb{position:static}
-  #ksb{order:1;font:12px/1.35 -apple-system,Segoe UI,Roboto,sans-serif;color:#e8ecef}
+  #ksb{order:2;font:12px/1.35 -apple-system,Segoe UI,Roboto,sans-serif;color:#e8ecef}
   /* Header sits at the bottom so it stays under your cursor while the panel opens upward. */
   #ksb .box{display:flex;flex-direction:column-reverse;background:#14181d;border:1px solid #2b323a;border-radius:10px;box-shadow:0 8px 30px rgba(0,0,0,.45);overflow:hidden}
   #ksb .hdr{display:flex;align-items:center;gap:8px;padding:7px 10px;background:#1b2128;cursor:pointer;user-select:none;white-space:nowrap}

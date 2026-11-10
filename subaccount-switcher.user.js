@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Subaccount Switcher
 // @namespace    trading-ui-scripts
-// @version      2.7
+// @version      2.8
 // @description  Fast subaccount switching, resting orders / positions / P&L / canceled orders on the current market across all subaccounts, and per-subaccount fill history.
 // @match        https://kalshi.com/*
 // @run-at       document-start
@@ -491,7 +491,7 @@
   // ---------- UI ----------
   const css = `
   #tus-dock > #ksw{position:static}   /* in case an old copy's styles are still on the page */
-  #ksw{order:2;font:12px/1.35 -apple-system,Segoe UI,Roboto,sans-serif;color:#e8ecef}
+  #ksw{order:1;font:12px/1.35 -apple-system,Segoe UI,Roboto,sans-serif;color:#e8ecef}
   /* Header sits at the bottom so it stays under your cursor while the panel opens upward. */
   #ksw .box{display:flex;flex-direction:column-reverse;background:#14181d;border:1px solid #2b323a;border-radius:10px;box-shadow:0 8px 30px rgba(0,0,0,.45);overflow:hidden;max-width:440px}
   #ksw .hdr{display:flex;align-items:center;gap:8px;padding:7px 10px;background:#1b2128;cursor:pointer;user-select:none;white-space:nowrap}
