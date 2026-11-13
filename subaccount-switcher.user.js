@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Subaccount Switcher
 // @namespace    trading-ui-scripts
-// @version      2.8
+// @version      2.9
 // @description  Fast subaccount switching, resting orders / positions / P&L / canceled orders on the current market across all subaccounts, and per-subaccount fill history.
 // @match        https://kalshi.com/*
 // @run-at       document-start
@@ -66,19 +66,28 @@
     while (!siteHeaders['x-csrf-token'] && Date.now() - t0 < ms) await sleep(200);
     return !!siteHeaders['x-csrf-token'];
   }
-  // Read-only GETs to Kalshi's API only. At most MAX_CONCURRENT in flight so we never
-  // burst your account's rate limit (which your other tools/bots may share); on HTTP 429
-  // all background refreshing pauses for a couple of minutes.
-  const MAX_CONCURRENT = 3;
+  // Read-only GETs to Kalshi's API only. At most MAX_CONCURRENT in flight and at least
+  // MIN_GAP_MS between request starts, so we never burst your account's rate limit (which
+  // Kalshi's own page and your bots share). On HTTP 429 every trading-ui-scripts panel in
+  // every Kalshi tab pauses (the pause is kept in localStorage, shared with Shard Balances).
+  const MAX_CONCURRENT = 2;
+  const MIN_GAP_MS = 200;
+  const PAUSE_KEY = 'tus-pause-until';
   let inFlight = 0; const waiters = [];
-  let pausedUntil = 0;
-  const isPaused = () => Date.now() < pausedUntil;
+  let nextStart = 0;
+  const pausedUntil = () => { try { return Number(localStorage.getItem(PAUSE_KEY)) || 0; } catch (_) { return 0; } };
+  const isPaused = () => Date.now() < pausedUntil();
+  function pauseFor(ms) { try { localStorage.setItem(PAUSE_KEY, String(Math.max(pausedUntil(), Date.now() + ms))); } catch (_) {} }
   async function api(path) {
     while (inFlight >= MAX_CONCURRENT) await new Promise((r) => waiters.push(r));
-    if (isPaused()) { const w = waiters.shift(); if (w) w(); throw new Error('paused (rate limited)'); }
     inFlight++;
-    try { return await apiNow(path); }
-    finally { inFlight--; const w = waiters.shift(); if (w) w(); }
+    try {
+      const wait = nextStart - Date.now();
+      nextStart = Math.max(nextStart, Date.now()) + MIN_GAP_MS;
+      if (wait > 0) await sleep(wait);
+      if (isPaused()) throw new Error('paused (rate limited)');
+      return await apiNow(path);
+    } finally { inFlight--; const w = waiters.shift(); if (w) w(); }
   }
   async function apiNow(path) {
     const r = await origFetch(API + path, {
@@ -86,7 +95,11 @@
       credentials: 'include',
       headers: { Accept: 'application/json', ...siteHeaders },
     });
-    if (r.status === 429) { pausedUntil = Date.now() + 120000; throw new Error('Rate limited — pausing auto-refresh for 2 min'); }
+    if (r.status === 429) {
+      const ra = Number(r.headers.get('retry-after'));
+      pauseFor(Number.isFinite(ra) && ra > 0 ? Math.min(ra * 1000, 600000) : 120000);
+      throw new Error('Rate limited — pausing auto-refresh for 2 min');
+    }
     if (!r.ok) {
       let code = r.status;
       try { const j = await r.json(); code = (j.error && (j.error.code || j.error.message)) || code; } catch (_) {}
@@ -142,25 +155,54 @@
   function lsSet(k, v) { try { localStorage.setItem(k, v); } catch (_) {} }
 
   // ---------- Market data (orders + positions per subaccount) ----------
-  async function loadSub(n, ctx) {
+  // Resting orders: ONE call covers every subaccount (each order carries subaccount_number).
+  // Positions: one call per subaccount (without ?subaccount= Kalshi returns only sub 0, with no
+  // subaccount field), so those can't be combined.
+  const subOf = (x) => { const n = Math.trunc(Number(x.subaccount_number ?? x.subaccount ?? 0)); return Number.isFinite(n) ? n : 0; };
+  async function pagedAll(pathBase, field, maxPages) {
+    const out = []; let cursor = '';
+    for (let i = 0; i < maxPages; i++) {
+      const j = await api(pathBase + (cursor ? '&cursor=' + encodeURIComponent(cursor) : ''));
+      out.push(...(j[field] || []));
+      cursor = j.cursor || '';
+      if (!cursor) break;
+    }
+    return out;
+  }
+  async function loadOrdersAllSubs(q) {
+    const bySub = {};
+    for (const o of await pagedAll(`/portfolio/orders?status=resting&limit=1000&${q}`, 'orders', 5)) (bySub[subOf(o)] || (bySub[subOf(o)] = [])).push(o);
+    return bySub;
+  }
+  async function loadSub(n, ctx, ordersBySub, ordersErr) {
     const q = ctx.event ? 'event_ticker=' + encodeURIComponent(ctx.event) : 'ticker=' + encodeURIComponent(ctx.market);
-    const [o, p] = await Promise.allSettled([
-      api(`/portfolio/orders?status=resting&limit=200&subaccount=${n}&${q}`),
+    let traded = null, error = ordersErr || null;
+    try {
       // settlement_status=all + total_traded: includes flat and settled markets, for P&L on closed markets
-      api(`/portfolio/positions?limit=200&count_filter=total_traded&settlement_status=all&subaccount=${n}&${q}`),
-    ]);
-    // If the API ignores the subaccount param and returns everything, filter by field when present.
-    const keep = (x) => {
-      const s = x.subaccount ?? x.subaccount_number;
-      return s === undefined || s === null || Number(s) === n;
-    };
-    const orders = o.status === 'fulfilled' ? (o.value.orders || []).filter(keep) : null;
-    const traded = p.status === 'fulfilled' ? (p.value.market_positions || []).filter(keep) : null;
+      const j = await api(`/portfolio/positions?limit=200&count_filter=total_traded&settlement_status=all&subaccount=${n}&${q}`);
+      traded = (j.market_positions || []).filter((x) => { const s = x.subaccount ?? x.subaccount_number; return s == null || Number(s) === n; });
+    } catch (e) { error = e.message; }
+    const orders = ordersBySub ? (ordersBySub[n] || []) : null;
     const positions = traded && traded.filter((x) => num(x.position, x.position_fp) !== 0);
-    return {
-      n, orders, positions, traded,
-      error: o.status === 'rejected' ? o.reason.message : (p.status === 'rejected' ? p.reason.message : null),
-    };
+    return { n, orders, positions, traded, error };
+  }
+
+  // ---------- Cache across reloads ----------
+  // Switching subaccount reloads the page, but this data doesn't depend on the active
+  // subaccount, so keep the last load (per tab, sessionStorage) and reuse it if it's fresh.
+  const CACHE_KEY = 'ksw-cache-v1';
+  const CACHE_TTL = 60000;
+  const SLIM = /ticker|side|action|price|count|subaccount|order_id|status|time|exposure|position|pnl|traded|fees/;
+  const slim = (x) => { const o = {}; for (const k in x) if (SLIM.test(k)) o[k] = x[k]; return o; };
+  const slimArr = (a) => (Array.isArray(a) ? a.map(slim) : a);
+  function cacheRead(kind, key) {
+    try {
+      const c = JSON.parse(sessionStorage.getItem(CACHE_KEY + ':' + kind));
+      return c && c.key === key && Date.now() - c.at < CACHE_TTL ? c : null;
+    } catch (_) { return null; }
+  }
+  function cacheWrite(kind, key, data) {
+    try { sessionStorage.setItem(CACHE_KEY + ':' + kind, JSON.stringify({ key, at: Date.now(), data })); } catch (_) {}
   }
 
   // Settlements are only needed for the P&L tab, so they're fetched on demand.
@@ -277,11 +319,19 @@
           const tq = encodeURIComponent(tickers.join(','));
           const recent = await pagedFills(`/portfolio/fills?limit=200&ticker=${tq}`, 5);
           recent.fills.forEach((f) => add(f, false));
-          // Archive: older fills, one market at a time.
+          // Archive: older fills, one market at a time. The archive doesn't change, so it's
+          // fetched once per market and reused by refreshes (only recent fills are re-pulled).
           let archiveErr = null;
-          for (const t of tickers.slice(0, 8)) {
-            try { (await pagedFills(`/historical/fills?limit=200&ticker=${encodeURIComponent(t)}`, 2)).fills.forEach((f) => add(f, true)); }
-            catch (e) { if (!/^404/.test(e.message)) archiveErr = e.message; }
+          const archKey = key + '|' + tickers.slice(0, 8).join(',');
+          if (hist.arch && hist.arch.key === archKey) hist.arch.rows.forEach((f) => add(f, true));
+          else {
+            const arch = [];
+            for (const t of tickers.slice(0, 8)) {
+              try { arch.push(...(await pagedFills(`/historical/fills?limit=200&ticker=${encodeURIComponent(t)}`, 2)).fills); }
+              catch (e) { if (!/^404/.test(e.message)) archiveErr = e.message; }
+            }
+            arch.forEach((f) => add(f, true));
+            if (!archiveErr) hist.arch = { key: archKey, rows: arch };
           }
           const notes = [];
           if (recent.more) notes.push('showing the most recent 1,000 fills plus the archive');
@@ -385,14 +435,15 @@
   // a position counts if its series is listed on the page, or its event's Kalshi category
   // matches the page (event categories are looked up once and cached in your browser).
   const ov = { at: 0, bySub: null, orders: null, loading: false, err: null };
-  const CAT_CACHE_KEY = 'ksw-evcat';
+  // Kalshi categories are per series, so one lookup per series (a few dozen) instead of per event.
+  const CAT_CACHE_KEY = 'ksw-sercat';
   let catCache = (() => { try { const c = JSON.parse(localStorage.getItem(CAT_CACHE_KEY)); return c && typeof c === 'object' ? c : {}; } catch (_) { return {}; } })();
   const saveCats = () => {
     const keys = Object.keys(catCache);
     if (keys.length > 3000) keys.slice(0, keys.length - 3000).forEach((k) => delete catCache[k]);
     lsSet(CAT_CACHE_KEY, JSON.stringify(catCache));
   };
-  const eventOf = (t) => { t = String(t || ''); const i = t.lastIndexOf('-'); return i > 0 ? t.slice(0, i) : t; };
+  const seriesOf = (t) => String(t || '').split('-')[0].toUpperCase();
   function categoryContext() {
     if (marketContext()) return null;
     const m = /^\/category\/([^/?#]+)(?:\/([^/?#]+))?/.exec(location.pathname);
@@ -417,27 +468,20 @@
     ov.loading = true; ov.err = null; render();
     try {
       if (!(await waitForHeaders())) throw new Error('Waiting for Kalshi to load — try refresh.');
-      // Resting orders: one call covers every subaccount.
-      const orders = [];
-      let cursor = '';
-      for (let i = 0; i < 3; i++) {
-        const j = await api('/portfolio/orders?status=resting&limit=1000' + (cursor ? '&cursor=' + encodeURIComponent(cursor) : ''));
-        orders.push(...(j.orders || [])); cursor = j.cursor || ''; if (!cursor) break;
-      }
+      // Resting orders: one call covers every subaccount (5 pages: bots can keep 3,000+ resting).
+      const orders = await pagedAll('/portfolio/orders?status=resting&limit=1000', 'orders', 5);
       const bySub = {};
       for (const s of SUBACCOUNTS) bySub[s.n] = { positions: [], orders: [] };
-      for (const o of orders) {
-        const n = Math.trunc(Number(o.subaccount_number ?? o.subaccount ?? 0));
-        (bySub[n] || (bySub[n] = { positions: [], orders: [] })).orders.push(o);
-      }
+      for (const o of orders) (bySub[subOf(o)] || (bySub[subOf(o)] = { positions: [], orders: [] })).orders.push(slim(o));
       // Open positions: one call per subaccount.
       await Promise.all(SUBACCOUNTS.map(async (s) => {
         try {
           const j = await api(`/portfolio/positions?limit=1000&count_filter=position&subaccount=${s.n}`);
-          bySub[s.n].positions = (j.market_positions || []).filter((p) => num(p.position, p.position_fp) !== 0);
+          bySub[s.n].positions = (j.market_positions || []).filter((p) => num(p.position, p.position_fp) !== 0).map(slim);
         } catch (e) { bySub[s.n].error = e.message; }
       }));
       ov.bySub = bySub; ov.at = Date.now();
+      if (!Object.values(bySub).some((r) => r.error)) cacheWrite('ov', 'ov', bySub);
       await loadCategories();
     } catch (e) { ov.err = e.message; }
     ov.loading = false; render();
@@ -446,10 +490,10 @@
   async function loadCategories() {
     if (!categoryContext() || !ov.bySub) return;
     const events = new Set();
-    for (const r of Object.values(ov.bySub)) for (const x of [...r.positions, ...r.orders]) events.add(eventOf(x.ticker));
-    const todo = [...events].filter((e) => e && !(e in catCache)).slice(0, 60);
+    for (const r of Object.values(ov.bySub)) for (const x of [...r.positions, ...r.orders]) events.add(seriesOf(x.ticker));
+    const todo = [...events].filter((e) => e && !(e in catCache)).slice(0, 20);
     for (const e of todo) {
-      try { const j = await api(`/events/${encodeURIComponent(e)}`); catCache[e] = String((j.event && j.event.category) || ''); }
+      try { const j = await api(`/series/${encodeURIComponent(e)}`); catCache[e] = String((j.series && j.series.category) || ''); }
       catch (err) { if (/^404|not_found/i.test(err.message)) catCache[e] = ''; else break; }
     }
     if (todo.length) saveCats();
@@ -464,7 +508,7 @@
       if (!narrow) return true;
       const t = String(x.ticker || '').toUpperCase();
       for (const se of series) if (t.startsWith(se + '-')) return true;
-      return catMatches(cat.slug, catCache[eventOf(t)]);
+      return catMatches(cat.slug, catCache[seriesOf(t)]);
     };
     const out = {};
     for (const [n, r] of Object.entries(ov.bySub)) out[n] = { n: Number(n), positions: r.positions.filter(keep), orders: r.orders.filter(keep), error: r.error };
@@ -799,13 +843,21 @@
     }
     const myKey = key;
     const fresh = {};
+    const q = ctx.event ? 'event_ticker=' + encodeURIComponent(ctx.event) : 'ticker=' + encodeURIComponent(ctx.market);
+    let ordersBySub = null, ordersErr = null;
+    try { ordersBySub = await loadOrdersAllSubs(q); } catch (e) { ordersErr = e.message; }
     await Promise.all(SUBACCOUNTS.map(async (s) => {
-      try { fresh[s.n] = await loadSub(s.n, ctx); }
+      try { fresh[s.n] = await loadSub(s.n, ctx, ordersBySub, ordersErr); }
       catch (e) { fresh[s.n] = { n: s.n, orders: [], positions: [], error: e.message }; }
       if (state.ctxKey === myKey && !sameMarket) { state.results[s.n] = fresh[s.n]; render(); }
     }));
     if (state.ctxKey === myKey) {
       state.results = fresh; state.loading = false; render();
+      if (!Object.values(fresh).some((r) => r.error)) {
+        const slimmed = {};
+        for (const [n, r] of Object.entries(fresh)) slimmed[n] = { ...r, orders: slimArr(r.orders), positions: slimArr(r.positions), traded: slimArr(r.traded) };
+        cacheWrite('mkt', key, slimmed);
+      }
       if (view() === 'pnl') loadSettlements(!sameMarket ? true : false);
       if (view() === 'canceled' && !sameMarket) loadCanceled(true);
       if (view() === 'history' && histMarketOnly() && !sameMarket) loadHistory(true);
@@ -907,11 +959,31 @@
     if (view() === 'history') loadHistory(true);
   }
 
+  // Reuse the previous page's load (e.g. right after a subaccount switch) if it's under a minute old.
+  function loadFromCache() {
+    const ctx = marketContext();
+    if (ctx) {
+      const key = (ctx.event || '') + '|' + (ctx.market || '');
+      const c = cacheRead('mkt', key);
+      if (!c) return false;
+      state.ctxKey = key; state.results = c.data; lastTick = c.at;
+    } else {
+      const c = cacheRead('ov', 'ov');
+      if (!c) return false;
+      ov.bySub = c.data; ov.at = c.at; lastTick = c.at;
+      loadCategories().then(render);
+    }
+    render();
+    return true;
+  }
+
   function start() {
     build();
-    if (marketContext()) refresh(true);    // one load per page so the ⚡ indicator is right
-    else loadOverview(true);
-    lastTick = Date.now();
+    if (!loadFromCache()) {
+      if (marketContext()) refresh(true);    // one load per page so the ⚡ indicator is right
+      else loadOverview(true);
+      lastTick = Date.now();
+    }
     learnNames();
     setInterval(learnNames, 1500);
     sweepOldCopies();
@@ -932,7 +1004,7 @@
       }
     }, 400);
     // Background refresh: only while the panel is open/pinned and the tab is visible.
-    setInterval(() => backgroundTick(false), 45000);
+    setInterval(() => backgroundTick(false), 60000);
   }
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', start);
   else start();

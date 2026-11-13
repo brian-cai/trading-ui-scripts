@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Shard Balances
 // @namespace    trading-ui-scripts
-// @version      3.2
+// @version      3.3
 // @description  Hover panel showing, for the active subaccount, cash and estimated position value on each exchange shard.
 // @match        https://kalshi.com/*
 // @run-at       document-start
@@ -22,7 +22,8 @@
     { i: 2, name: 'Crypto/Cmdty' },
     { i: 3, name: 'Sports' },
   ];
-  const REFRESH_MS = 60000;           // background refresh while the tab is visible
+  const REFRESH_MS = 60000;           // background refresh while the panel is open/pinned and the tab is visible
+  const IDLE_REFRESH_MS = 300000;     // while collapsed, only the header total shows: refresh it every 5 min
   const LS_SUB = 'kalshi-subaccount'; // the site's active-subaccount setting
   const NAMES_KEY = 'ksw-names';      // names learned by the Subaccount Switcher script
   // ──────────────────────────────────────────────────────────
@@ -50,12 +51,23 @@
     while (!siteHeaders['x-csrf-token'] && Date.now() - t0 < ms) await sleep(200);
     return !!siteHeaders['x-csrf-token'];
   }
-  // Read-only GETs to Kalshi's API only, one at a time. On HTTP 429, refreshing pauses for 2 minutes.
-  let pausedUntil = 0;
+  // Read-only GETs to Kalshi's API only, one at a time, at least 200 ms apart. On HTTP 429 every
+  // trading-ui-scripts panel in every Kalshi tab pauses (shared with the Subaccount Switcher).
+  const PAUSE_KEY = 'tus-pause-until';
+  const pausedUntil = () => { try { return Number(localStorage.getItem(PAUSE_KEY)) || 0; } catch (_) { return 0; } };
+  function pauseFor(ms) { try { localStorage.setItem(PAUSE_KEY, String(Math.max(pausedUntil(), Date.now() + ms))); } catch (_) {} }
+  let lastReq = 0;
   async function api(path) {
-    if (Date.now() < pausedUntil) throw new Error('paused (rate limited)');
+    const wait = lastReq + 200 - Date.now();
+    if (wait > 0) await sleep(wait);
+    lastReq = Date.now();
+    if (Date.now() < pausedUntil()) throw new Error('paused (rate limited)');
     const r = await origFetch(API + path, { method: 'GET', credentials: 'include', headers: { Accept: 'application/json', ...siteHeaders } });
-    if (r.status === 429) { pausedUntil = Date.now() + 120000; throw new Error('Rate limited — pausing refresh for 2 min'); }
+    if (r.status === 429) {
+      const ra = Number(r.headers.get('retry-after'));
+      pauseFor(Number.isFinite(ra) && ra > 0 ? Math.min(ra * 1000, 600000) : 120000);
+      throw new Error('Rate limited — pausing refresh for 2 min');
+    }
     if (!r.ok) {
       let code = r.status;
       try { const j = await r.json(); code = (j.error && (j.error.code || j.error.message)) || code; } catch (_) {}
@@ -151,8 +163,17 @@
     return { value: cost, cost, priced: false };
   }
 
+  // Last load per subaccount, kept for this tab across reloads (a subaccount switch reloads the page).
+  const CACHE_KEY = 'ksb-cache-v1', CACHE_TTL = 60000;
+  function fromCache(sub) {
+    try {
+      const c = JSON.parse(sessionStorage.getItem(CACHE_KEY + ':' + sub));
+      if (!c || Date.now() - c.at > CACHE_TTL) return false;
+      data = c.data; dataSub = sub; lastAt = c.at; err = null; return true;
+    } catch (_) { return false; }
+  }
   async function load() {
-    if (loading || Date.now() < pausedUntil) return;
+    if (loading || Date.now() < pausedUntil()) return;
     loading = true; render();
     const sub = currentSub();
     try {
@@ -171,6 +192,7 @@
         if (!v.priced) s.unpriced++;
       }
       data = { cash, pos }; dataSub = sub; err = null;
+      try { sessionStorage.setItem(CACHE_KEY + ':' + sub, JSON.stringify({ at: Date.now(), data })); } catch (_) {}
     } catch (e) {
       err = e.message || String(e);
     }
@@ -298,12 +320,18 @@
     }
   }, true);
   // Subaccount switched in another tab → reload numbers for the new one.
-  window.addEventListener('storage', (e) => { if (e.key === LS_SUB) { render(); load(); } });
+  // (A hidden tab only redraws; it reloads when you come back to it.)
+  window.addEventListener('storage', (e) => { if (e.key === LS_SUB) { render(); if (!document.hidden) load(); } });
+  document.addEventListener('visibilitychange', () => { if (!document.hidden && (dataSub !== currentSub() || Date.now() - lastAt > IDLE_REFRESH_MS)) load(); });
 
   function start() {
     build();
-    load();
-    setInterval(() => { if (!document.hidden) load(); }, REFRESH_MS);
+    if (fromCache(currentSub())) render(); else load();
+    setInterval(() => {
+      if (document.hidden) return;
+      const shown = root && (root.classList.contains('open') || root.classList.contains('pinned'));
+      if (Date.now() - lastAt >= (shown ? REFRESH_MS : IDLE_REFRESH_MS) - 1000) load();
+    }, 15000);
   }
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', start);
   else start();
