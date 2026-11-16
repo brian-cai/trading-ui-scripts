@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Shard Balances
 // @namespace    trading-ui-scripts
-// @version      4.2
+// @version      4.3
 // @description  Click-to-open panel: cash and estimated position value on each exchange shard, for the active subaccount or every subaccount.
 // @match        https://kalshi.com/*
 // @run-at       document-start
@@ -61,7 +61,10 @@
   const PAUSE_KEY = 'tus-pause-until';
   const pausedUntil = () => { try { return Number(localStorage.getItem(PAUSE_KEY)) || 0; } catch (_) { return 0; } };
   function pauseFor(ms) { try { localStorage.setItem(PAUSE_KEY, String(Math.max(pausedUntil(), Date.now() + ms))); } catch (_) {} }
-  const RATE_MSG = 'Kalshi kept rate-limiting us (the account is busy) — wait 30 s, then click refresh';
+  const RATE_MSG = 'Kalshi kept rate-limiting us (the account is busy) — click refresh to try again';
+  // a refresh click is you asking: it always runs, clearing the pause (loads are rare: on page load and on click)
+  function clearPause() { try { localStorage.removeItem(PAUSE_KEY); } catch (_) {} }
+
   let lastReq = 0;
   // A 429 means the account's shared read budget (~30 GETs/s for every bot, Kalshi's page and these panels) was
   // empty for a moment; it refills in about a second and Kalshi sends no Retry-After. So retry quietly after 1.5, 3
@@ -431,7 +434,7 @@
     if (ex) { const k = ex.dataset.exp; if (expanded.has(k)) expanded.delete(k); else expanded.add(k); render(); return; }
     const a = e.target.closest('[data-act]');
     if (!a) return;
-    if (a.dataset.act === 'refresh') load(view() === 'subs' ? 'all' : 'one');
+    if (a.dataset.act === 'refresh') { clearPause(); load(view() === 'subs' ? 'all' : 'one'); }
     if (a.dataset.act === 'pin') {
       root.classList.toggle('pinned');
       try { localStorage.setItem(OPEN_KEY, isOpen() ? '1' : '0'); } catch (_) {}

@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Subaccount Switcher
 // @namespace    trading-ui-scripts
-// @version      3.1
+// @version      3.2
 // @description  Click-to-open panel: fast subaccount switching, resting orders / positions / P&L / canceled orders on the current market across all subaccounts, and per-subaccount fill history.
 // @match        https://kalshi.com/*
 // @run-at       document-start
@@ -77,6 +77,8 @@
   let nextStart = 0;
   const pausedUntil = () => { try { return Number(localStorage.getItem(PAUSE_KEY)) || 0; } catch (_) { return 0; } };
   const isPaused = () => Date.now() < pausedUntil();
+  // a refresh click is you asking: it always runs, clearing the pause (loads are rare: on page load and on click)
+  function clearPause() { try { localStorage.removeItem(PAUSE_KEY); } catch (_) {} }
   function pauseFor(ms) { try { localStorage.setItem(PAUSE_KEY, String(Math.max(pausedUntil(), Date.now() + ms))); } catch (_) {} }
   async function api(path) {
     while (inFlight >= MAX_CONCURRENT) await new Promise((r) => waiters.push(r));
@@ -107,7 +109,7 @@
       if (i >= RETRY_WAITS.length) {
         const ra = Number(r.headers.get('retry-after'));
         pauseFor(Number.isFinite(ra) && ra > 0 ? Math.min(ra * 1000, 600000) : FAIL_PAUSE_MS);
-        throw new Error('Kalshi kept rate-limiting us (the account is busy) — wait 30 s, then click refresh');
+        throw new Error('Kalshi kept rate-limiting us (the account is busy) — click refresh to try again');
       }
       await sleep(RETRY_WAITS[i]);
     }
@@ -808,7 +810,7 @@
       <div class="hdr" data-act="pin" title="${isOpen ? 'Click to minimize' : 'Click to open'}"><span class="cur">${cur} · ${esc(subName(cur))}</span>${alert}${dots}<span class="pin">${isOpen ? '–' : '+'}</span></div>
       ${oldCopy ? `<div class="stale">An <b>old copy</b> of this script is still installed. Open the Tampermonkey Dashboard and delete <b>"Kalshi Quick Subaccount Switcher + Market Orders"</b> (or any other older Subaccount Switcher).</div>` : ''}
       ${stale ? `<div class="stale">Subaccount changed to <b>${esc(subName(cur))}</b> in another tab — this page may still be trading on <b>${esc(subName(staleFrom))}</b>. <a data-act="reload">Reload</a></div>` : ''}
-      <div class="body">${isPaused() ? '<div class="note">Kalshi kept rate-limiting us (the account is busy) — wait 30 s before clicking refresh.</div>' : ''}${jump}<div class="grid">${subBtns}</div>
+      <div class="body">${isPaused() ? '<div class="note">Kalshi kept rate-limiting us (the account is busy) — click refresh to try again.</div>' : ''}${jump}<div class="grid">${subBtns}</div>
         <div class="tabs"><a data-view="market" class="${v === 'market' ? 'on' : ''}">${ctx ? 'This market' : categoryContext() ? 'This category' : 'Open activity'}</a><a data-view="pnl" class="${v === 'pnl' ? 'on' : ''}">P&amp;L</a><a data-view="canceled" class="${v === 'canceled' ? 'on' : ''}">Canceled</a><a data-view="history" class="${v === 'history' ? 'on' : ''}">History</a>
           <span class="sp"></span><a class="rf" data-act="refresh">${busy ? 'loading…' : 'refresh'}</a></div>
         <div class="view">${v === 'history' ? historyView(ctx) : v === 'pnl' ? pnlView(ctx) : v === 'canceled' ? canceledView(ctx) : ctx ? marketView(ctx) : overviewView(res)}</div>
@@ -874,6 +876,7 @@
     if (a.dataset.act === 'reload') location.reload();
     if (a.dataset.act === 'dismiss') { jumpDismissedFor = marketContext() ? state.ctxKey : 'ov|' + location.pathname; render(); }
     if (a.dataset.act === 'refresh') {
+      clearPause();
       if (view() === 'history') loadHistory(true);
       else if (view() === 'canceled') loadCanceled(true);
       else if (!marketContext()) loadOverview(true);
