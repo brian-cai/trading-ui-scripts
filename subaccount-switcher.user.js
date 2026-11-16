@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Subaccount Switcher
 // @namespace    trading-ui-scripts
-// @version      3.0
+// @version      3.1
 // @description  Click-to-open panel: fast subaccount switching, resting orders / positions / P&L / canceled orders on the current market across all subaccounts, and per-subaccount fill history.
 // @match        https://kalshi.com/*
 // @run-at       document-start
@@ -89,16 +89,27 @@
       return await apiNow(path);
     } finally { inFlight--; const w = waiters.shift(); if (w) w(); }
   }
+  // A 429 means the account's shared read budget (~30 GETs/s for every bot, Kalshi's page and these panels) was
+  // empty for a moment; it refills in about a second and Kalshi sends no Retry-After. So retry quietly after 1.5, 3
+  // and 6 s (as the bots do) and only pause the panels, for 30 s, if all of those fail too. It used to pause every
+  // panel in every tab for 2 minutes and show the notice on the first 429 (2026-11-16).
+  const RETRY_WAITS = [1500, 3000, 6000];
+  const FAIL_PAUSE_MS = 30000;
   async function apiNow(path) {
-    const r = await origFetch(API + path, {
-      method: 'GET',
-      credentials: 'include',
-      headers: { Accept: 'application/json', ...siteHeaders },
-    });
-    if (r.status === 429) {
-      const ra = Number(r.headers.get('retry-after'));
-      pauseFor(Number.isFinite(ra) && ra > 0 ? Math.min(ra * 1000, 600000) : 120000);
-      throw new Error('Kalshi rate-limited us — wait a minute, then click refresh');
+    let r;
+    for (let i = 0; ; i++) {
+      r = await origFetch(API + path, {
+        method: 'GET',
+        credentials: 'include',
+        headers: { Accept: 'application/json', ...siteHeaders },
+      });
+      if (r.status !== 429) break;
+      if (i >= RETRY_WAITS.length) {
+        const ra = Number(r.headers.get('retry-after'));
+        pauseFor(Number.isFinite(ra) && ra > 0 ? Math.min(ra * 1000, 600000) : FAIL_PAUSE_MS);
+        throw new Error('Kalshi kept rate-limiting us (the account is busy) — wait 30 s, then click refresh');
+      }
+      await sleep(RETRY_WAITS[i]);
     }
     if (!r.ok) {
       let code = r.status;
@@ -797,7 +808,7 @@
       <div class="hdr" data-act="pin" title="${isOpen ? 'Click to minimize' : 'Click to open'}"><span class="cur">${cur} · ${esc(subName(cur))}</span>${alert}${dots}<span class="pin">${isOpen ? '–' : '+'}</span></div>
       ${oldCopy ? `<div class="stale">An <b>old copy</b> of this script is still installed. Open the Tampermonkey Dashboard and delete <b>"Kalshi Quick Subaccount Switcher + Market Orders"</b> (or any other older Subaccount Switcher).</div>` : ''}
       ${stale ? `<div class="stale">Subaccount changed to <b>${esc(subName(cur))}</b> in another tab — this page may still be trading on <b>${esc(subName(staleFrom))}</b>. <a data-act="reload">Reload</a></div>` : ''}
-      <div class="body">${isPaused() ? '<div class="note">Kalshi rate-limited us — wait a minute before clicking refresh.</div>' : ''}${jump}<div class="grid">${subBtns}</div>
+      <div class="body">${isPaused() ? '<div class="note">Kalshi kept rate-limiting us (the account is busy) — wait 30 s before clicking refresh.</div>' : ''}${jump}<div class="grid">${subBtns}</div>
         <div class="tabs"><a data-view="market" class="${v === 'market' ? 'on' : ''}">${ctx ? 'This market' : categoryContext() ? 'This category' : 'Open activity'}</a><a data-view="pnl" class="${v === 'pnl' ? 'on' : ''}">P&amp;L</a><a data-view="canceled" class="${v === 'canceled' ? 'on' : ''}">Canceled</a><a data-view="history" class="${v === 'history' ? 'on' : ''}">History</a>
           <span class="sp"></span><a class="rf" data-act="refresh">${busy ? 'loading…' : 'refresh'}</a></div>
         <div class="view">${v === 'history' ? historyView(ctx) : v === 'pnl' ? pnlView(ctx) : v === 'canceled' ? canceledView(ctx) : ctx ? marketView(ctx) : overviewView(res)}</div>

@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Shard Balances
 // @namespace    trading-ui-scripts
-// @version      4.1
+// @version      4.2
 // @description  Click-to-open panel: cash and estimated position value on each exchange shard, for the active subaccount or every subaccount.
 // @match        https://kalshi.com/*
 // @run-at       document-start
@@ -61,18 +61,30 @@
   const PAUSE_KEY = 'tus-pause-until';
   const pausedUntil = () => { try { return Number(localStorage.getItem(PAUSE_KEY)) || 0; } catch (_) { return 0; } };
   function pauseFor(ms) { try { localStorage.setItem(PAUSE_KEY, String(Math.max(pausedUntil(), Date.now() + ms))); } catch (_) {} }
-  const RATE_MSG = 'Kalshi rate-limited us — wait a minute, then click refresh';
+  const RATE_MSG = 'Kalshi kept rate-limiting us (the account is busy) — wait 30 s, then click refresh';
   let lastReq = 0;
+  // A 429 means the account's shared read budget (~30 GETs/s for every bot, Kalshi's page and these panels) was
+  // empty for a moment; it refills in about a second and Kalshi sends no Retry-After. So retry quietly after 1.5, 3
+  // and 6 s (as the bots do) and only pause the panels, for 30 s, if all of those fail too. It used to pause every
+  // panel in every tab for 2 minutes and show the notice on the first 429 (2026-11-16).
+  const RETRY_WAITS = [1500, 3000, 6000];
+  const FAIL_PAUSE_MS = 30000;
   async function api(path) {
     const wait = lastReq + 200 - Date.now();
     if (wait > 0) await sleep(wait);
     lastReq = Date.now();
     if (Date.now() < pausedUntil()) throw new Error(RATE_MSG);
-    const r = await origFetch(API + path, { method: 'GET', credentials: 'include', headers: { Accept: 'application/json', ...siteHeaders } });
-    if (r.status === 429) {
-      const ra = Number(r.headers.get('retry-after'));
-      pauseFor(Number.isFinite(ra) && ra > 0 ? Math.min(ra * 1000, 600000) : 120000);
-      throw new Error(RATE_MSG);
+    let r;
+    for (let i = 0; ; i++) {
+      r = await origFetch(API + path, { method: 'GET', credentials: 'include', headers: { Accept: 'application/json', ...siteHeaders } });
+      if (r.status !== 429) break;
+      if (i >= RETRY_WAITS.length) {
+        const ra = Number(r.headers.get('retry-after'));
+        pauseFor(Number.isFinite(ra) && ra > 0 ? Math.min(ra * 1000, 600000) : FAIL_PAUSE_MS);
+        throw new Error(RATE_MSG);
+      }
+      await sleep(RETRY_WAITS[i]);
+      lastReq = Date.now();
     }
     if (!r.ok) {
       let code = r.status;

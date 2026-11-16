@@ -9,8 +9,10 @@ Updates are picked up automatically via `@updateURL`.
 
 Both panels sit in the bottom-right corner and open or close only when you click their header (no hover);
 the open/closed state is remembered. Neither polls: data loads once when the page loads (or when you move
-to another market in the app), then only when you click **refresh**. A 429 from Kalshi pauses both panels
-in every tab for a couple of minutes.
+to another market in the app), then only when you click **refresh**. The account has one read budget
+(~30 GETs/s) shared with every bot and Kalshi's own page, so a 429 just means it was empty for a moment: a
+request retries quietly after 1.5, 3 and 6 s, and only if all of those fail do both panels pause (every tab)
+for 30 s and say so.
 
 - One-click / Alt+Shift+0–9 subaccount switching
 - On a market page: resting orders and positions on that event across all subaccounts
