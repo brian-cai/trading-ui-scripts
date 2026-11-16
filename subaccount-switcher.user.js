@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Subaccount Switcher
 // @namespace    trading-ui-scripts
-// @version      2.9
-// @description  Fast subaccount switching, resting orders / positions / P&L / canceled orders on the current market across all subaccounts, and per-subaccount fill history.
+// @version      3.0
+// @description  Click-to-open panel: fast subaccount switching, resting orders / positions / P&L / canceled orders on the current market across all subaccounts, and per-subaccount fill history.
 // @match        https://kalshi.com/*
 // @run-at       document-start
 // @grant        none
@@ -98,7 +98,7 @@
     if (r.status === 429) {
       const ra = Number(r.headers.get('retry-after'));
       pauseFor(Number.isFinite(ra) && ra > 0 ? Math.min(ra * 1000, 600000) : 120000);
-      throw new Error('Rate limited — pausing auto-refresh for 2 min');
+      throw new Error('Kalshi rate-limited us — wait a minute, then click refresh');
     }
     if (!r.ok) {
       let code = r.status;
@@ -294,7 +294,7 @@
     const ctx = marketContext();
     const onlyMarket = !!ctx && histMarketOnly();
     const key = onlyMarket ? 'mkt|' + state.ctxKey : 'recent';
-    if (!force && hist.key === key && hist.rows) return;
+    if (!force && hist.key === key && (hist.rows || hist.loading)) return;
     hist.key = key; hist.loading = true; hist.err = null; hist.note = null; render();
     try {
       if (!(await waitForHeaders())) throw new Error('Waiting for Kalshi to load — try refresh.');
@@ -382,7 +382,7 @@
     const ctx = marketContext();
     if (!ctx) return;
     const key = state.ctxKey;
-    if (!force && canc.key === key && canc.rows) return;
+    if (!force && canc.key === key && (canc.rows || canc.loading)) return;
     canc.key = key; canc.loading = true; canc.err = null; canc.note = null; render();
     try {
       if (!(await waitForHeaders())) throw new Error('Waiting for Kalshi to load — try refresh.');
@@ -545,12 +545,11 @@
   #ksw .dot{width:7px;height:7px;border-radius:50%}
   #ksw .dot.o{background:#5aa9ff}#ksw .dot.p{background:#2fd27f}
   #ksw .pin{color:#9aa6b2;font-size:14px;line-height:1;width:20px;height:18px;display:inline-flex;align-items:center;justify-content:center;border-radius:5px;margin-left:2px}
-  #ksw .pin:hover{background:#2b333d;color:#fff}
-  /* Collapsed by default. Hover opens it; clicking inside keeps it open until you click
-     elsewhere or press Esc; clicking the header pins it open across page loads. */
-  #ksw:not(.pinned):not(.open) .body{display:none}
-  #ksw:not(.pinned):not(.open) .box{opacity:.85}
-  #ksw.open .box,#ksw.pinned .box{min-width:320px}
+  #ksw .hdr:hover .pin{background:#2b333d;color:#fff}
+  /* Opens and closes only by clicking the header (or Alt+Shift+\`); remembered across page loads. */
+  #ksw:not(.pinned) .body{display:none}
+  #ksw:not(.pinned) .box{opacity:.85}
+  #ksw.pinned .box{min-width:320px}
   #ksw .stale{background:#3d1717;color:#ffd0d0;padding:6px 10px;border-bottom:1px solid #6b2525}
   #ksw .stale a{color:#fff;text-decoration:underline;cursor:pointer;font-weight:600}
   #ksw .note{color:#f5a524;font-size:11px;padding:4px 10px 0}
@@ -629,17 +628,12 @@
     root = document.createElement('div'); root.id = 'ksw';
     if (lsGet('ksw-open', '1') === '1') root.classList.add('pinned');   // open by default
     getDock().appendChild(root);
-    makeOpenable(root, () => {
-      render();
-      if (root.classList.contains('open')) backgroundTick(true);
-    });
     render();
   }
 
   function togglePin() {
     root.classList.toggle('pinned');
     lsSet('ksw-open', root.classList.contains('pinned') ? '1' : '0');
-    if (!root.classList.contains('pinned')) { root._minH = 0; root._noPeek = true; if (root._closeNow) root._closeNow(); }
     render();
   }
 
@@ -798,34 +792,16 @@
     const v = view();
     const busy = v === 'history' ? hist.loading : v === 'canceled' ? canc.loading : ctx ? state.loading : ov.loading;
 
-    const isOpen = root.classList.contains('open') || root.classList.contains('pinned');
-    const prevBox = root.firstElementChild;
-    if (isOpen && prevBox) root._minH = Math.max(root._minH || 0, prevBox.offsetHeight);
+    const isOpen = root.classList.contains('pinned');
     root.innerHTML = `<div class="box">
-      <div class="hdr" data-act="pin" title="${root.classList.contains('pinned') ? 'Click to minimize' : 'Minimized — hover to peek, click to keep open'}"><span class="cur">${cur} · ${esc(subName(cur))}</span>${alert}${dots}<span class="pin" title="${root.classList.contains('pinned') ? 'Minimize' : 'Keep open'}">${root.classList.contains('pinned') ? '–' : '+'}</span></div>
+      <div class="hdr" data-act="pin" title="${isOpen ? 'Click to minimize' : 'Click to open'}"><span class="cur">${cur} · ${esc(subName(cur))}</span>${alert}${dots}<span class="pin">${isOpen ? '–' : '+'}</span></div>
       ${oldCopy ? `<div class="stale">An <b>old copy</b> of this script is still installed. Open the Tampermonkey Dashboard and delete <b>"Kalshi Quick Subaccount Switcher + Market Orders"</b> (or any other older Subaccount Switcher).</div>` : ''}
       ${stale ? `<div class="stale">Subaccount changed to <b>${esc(subName(cur))}</b> in another tab — this page may still be trading on <b>${esc(subName(staleFrom))}</b>. <a data-act="reload">Reload</a></div>` : ''}
-      <div class="body">${isPaused() ? '<div class="note">Kalshi rate-limited us — auto-refresh paused for a moment.</div>' : ''}${jump}<div class="grid">${subBtns}</div>
+      <div class="body">${isPaused() ? '<div class="note">Kalshi rate-limited us — wait a minute before clicking refresh.</div>' : ''}${jump}<div class="grid">${subBtns}</div>
         <div class="tabs"><a data-view="market" class="${v === 'market' ? 'on' : ''}">${ctx ? 'This market' : categoryContext() ? 'This category' : 'Open activity'}</a><a data-view="pnl" class="${v === 'pnl' ? 'on' : ''}">P&amp;L</a><a data-view="canceled" class="${v === 'canceled' ? 'on' : ''}">Canceled</a><a data-view="history" class="${v === 'history' ? 'on' : ''}">History</a>
           <span class="sp"></span><a class="rf" data-act="refresh">${busy ? 'loading…' : 'refresh'}</a></div>
         <div class="view">${v === 'history' ? historyView(ctx) : v === 'pnl' ? pnlView(ctx) : v === 'canceled' ? canceledView(ctx) : ctx ? marketView(ctx) : overviewView(res)}</div>
       </div></div>`;
-    // Never shrink under the cursor while open (that used to close the panel).
-    if (isOpen && root._minH) root.firstElementChild.style.minHeight = root._minH + 'px';
-  }
-
-  // Open/close controller shared by the panels.
-  function makeOpenable(el, onChange) {
-    let held = false, timer = null;
-    const open = () => { clearTimeout(timer); if (el._noPeek) return; if (!el.classList.contains('open')) { el.classList.add('open'); onChange(); } };
-    const close = () => { clearTimeout(timer); held = false; if (el.classList.contains('open')) { el.classList.remove('open'); el._minH = 0; onChange(); } };
-    el.addEventListener('mouseenter', open);
-    el.addEventListener('mouseleave', () => { el._noPeek = false; if (!held) { clearTimeout(timer); timer = setTimeout(close, 300); } });
-    el.addEventListener('pointerdown', (e) => { if (e.target.closest && e.target.closest('[data-act="pin"]')) return; held = true; open(); }, true);
-    el._closeNow = close;
-    document.addEventListener('pointerdown', (e) => { if (!el.contains(e.target)) close(); }, true);
-    window.addEventListener('keydown', (e) => { if (e.key === 'Escape') close(); }, true);
-    return { close };
   }
 
   async function refresh(force) {
@@ -949,14 +925,16 @@
     if (oldCopy !== was) render();
   }
 
-  let lastTick = 0;
-  function backgroundTick(onOpen) {
-    if (document.hidden || isPaused()) return;
-    if (!root || !(root.classList.contains('open') || root.classList.contains('pinned'))) return;
-    if (onOpen && Date.now() - lastTick < 20000) return;   // just refreshed; don't refetch on every hover
-    lastTick = Date.now();
-    if (marketContext()) refresh(true); else loadOverview(true);
-    if (view() === 'history') loadHistory(true);
+  // No background polling: data loads once per page (and on in-app navigation to another
+  // market or page), then only when you click refresh. That keeps us well clear of Kalshi's
+  // rate limit, which the site and your bots share.
+
+  // The open tab's own data (settlements, cancels, fills), once per page.
+  function loadViewData() {
+    const v = view(), ctx = marketContext();
+    if (v === 'history') loadHistory(false);
+    else if (v === 'pnl' && ctx) loadSettlements(false);
+    else if (v === 'canceled' && ctx) loadCanceled(false);
   }
 
   // Reuse the previous page's load (e.g. right after a subaccount switch) if it's under a minute old.
@@ -966,11 +944,11 @@
       const key = (ctx.event || '') + '|' + (ctx.market || '');
       const c = cacheRead('mkt', key);
       if (!c) return false;
-      state.ctxKey = key; state.results = c.data; lastTick = c.at;
+      state.ctxKey = key; state.results = c.data;
     } else {
       const c = cacheRead('ov', 'ov');
       if (!c) return false;
-      ov.bySub = c.data; ov.at = c.at; lastTick = c.at;
+      ov.bySub = c.data; ov.at = c.at;
       loadCategories().then(render);
     }
     render();
@@ -979,11 +957,9 @@
 
   function start() {
     build();
-    if (!loadFromCache()) {
-      if (marketContext()) refresh(true);    // one load per page so the ⚡ indicator is right
-      else loadOverview(true);
-      lastTick = Date.now();
-    }
+    if (loadFromCache()) loadViewData();
+    else if (marketContext()) refresh(true).then(loadViewData);   // one load per page so the ⚡ indicator is right
+    else { loadOverview(true); loadViewData(); }
     learnNames();
     setInterval(learnNames, 1500);
     sweepOldCopies();
@@ -1003,8 +979,6 @@
         if (view() === 'history' && histMarketOnly()) setTimeout(() => loadHistory(false), 1500);
       }
     }, 400);
-    // Background refresh: only while the panel is open/pinned and the tab is visible.
-    setInterval(() => backgroundTick(false), 60000);
   }
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', start);
   else start();
