@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Shard Balances
 // @namespace    trading-ui-scripts
-// @version      4.0
+// @version      4.1
 // @description  Click-to-open panel: cash and estimated position value on each exchange shard, for the active subaccount or every subaccount.
 // @match        https://kalshi.com/*
 // @run-at       document-start
@@ -89,7 +89,7 @@
   const money = (v) => {
     if (!v) return '$0';
     const a = Math.abs(v);
-    const s = a >= 100000 ? '$' + Math.round(a / 1000) + 'k' : '$' + a.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+    const s = '$' + (a >= 100000 ? Math.round(a).toLocaleString() : a.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 }));
     return v < 0 ? '−' + s : s;
   };
   const signed = (v) => (v >= 0 ? '+' : '−') + money(Math.abs(v));
@@ -339,6 +339,7 @@
   // (click to expand into per-shard totals across subaccounts).
   const expanded = new Set();
   function subsView(cur) {
+    if (!store.allAt) return '';            // never a partial table: wait for the first all-subaccounts load
     const ns = [...new Set([...store.known, ...Object.keys(store.subs).map(Number)])].filter((n) => store.subs[n]).sort((a, b) => a - b);
     if (!ns.length) return '';
     const snaps = ns.map((n) => store.subs[n]);
